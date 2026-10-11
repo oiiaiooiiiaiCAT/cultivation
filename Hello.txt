@@ -1,5 +1,1 @@
-<<<<<<< HEAD
 goodbye world
-=======
-hello world
->>>>>>> 76e6fe2898339862812be8228db79f173912a6e7
