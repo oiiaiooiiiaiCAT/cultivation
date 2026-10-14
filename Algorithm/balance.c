@@ -12,6 +12,70 @@
 
 BalanceCar_TypeDef g_car;
 static uint16_t pendingButtons;
+
+static uint32_t yawUpdatedAt;
+
+static void Car_ResetYawPid(float referenceDeg)
+{
+    g_car.yawPid.referenceDeg = referenceDeg;
+    g_car.yawPid.errorDeg = 0.0f;
+    g_car.yawPid.integralMa = 0.0f;
+    g_car.yawPid.correctionMa = 0.0f;
+    yawUpdatedAt = HAL_GetTick();
+}
+
+static int16_t Car_UpdateYawPid(float yawDeg, float yawRateDps)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t elapsedMs = now - yawUpdatedAt;
+    float errorDeg = g_car.yawPid.referenceDeg - yawDeg;
+    float limitMa = (float)LQR_CURRENT_LIMIT_MA - fabsf((float)g_lqr.currentMa);
+    float proportionalDerivativeMa;
+    float integralMa;
+    float correctionMa;
+    yawUpdatedAt = now;
+    if (!isfinite(errorDeg) || !isfinite(yawRateDps) ||
+        !isfinite(g_car.yawPid.kp) || !isfinite(g_car.yawPid.ki) ||
+        !isfinite(g_car.yawPid.kd) || !isfinite(g_car.yawPid.outputSign) ||
+        !isfinite(g_car.yawPid.integralMa))
+    {
+        g_car.yawPid.errorDeg = 0.0f;
+        g_car.yawPid.correctionMa = 0.0f;
+        return 0;
+    }
+    errorDeg = fmodf(errorDeg, 360.0f);
+    if (errorDeg > 180.0f) errorDeg -= 360.0f;
+    if (errorDeg < -180.0f) errorDeg += 360.0f;
+    if (limitMa > YAW_PID_MAX_CORRECTION_MA) limitMa = YAW_PID_MAX_CORRECTION_MA;
+    if (limitMa < 0.0f) limitMa = 0.0f;
+    integralMa = g_car.yawPid.integralMa;
+    /* Skip integration after a debugger pause or a delayed control cycle. */
+    if (elapsedMs <= 50U)
+        integralMa += g_car.yawPid.ki * errorDeg * (float)elapsedMs * 0.001f;
+    if (integralMa > YAW_PID_INTEGRAL_LIMIT_MA) integralMa = YAW_PID_INTEGRAL_LIMIT_MA;
+    if (integralMa < -YAW_PID_INTEGRAL_LIMIT_MA) integralMa = -YAW_PID_INTEGRAL_LIMIT_MA;
+    /* D acts on measured yaw rate, avoiding an angle-wrap derivative spike. */
+    proportionalDerivativeMa = g_car.yawPid.kp * errorDeg - g_car.yawPid.kd * yawRateDps;
+    correctionMa = proportionalDerivativeMa + integralMa;
+    if (!isfinite(correctionMa))
+    {
+        g_car.yawPid.correctionMa = 0.0f;
+        return 0;
+    }
+    /* Do not accumulate integral further into the available-current limit. */
+    if ((correctionMa > limitMa && integralMa > g_car.yawPid.integralMa) ||
+        (correctionMa < -limitMa && integralMa < g_car.yawPid.integralMa))
+        integralMa = g_car.yawPid.integralMa;
+    correctionMa = proportionalDerivativeMa + integralMa;
+    if (correctionMa > limitMa) correctionMa = limitMa;
+    if (correctionMa < -limitMa) correctionMa = -limitMa;
+    correctionMa *= g_car.yawPid.outputSign < 0.0f ? -1.0f : 1.0f;
+    g_car.yawPid.errorDeg = errorDeg;
+    g_car.yawPid.integralMa = integralMa;
+    g_car.yawPid.correctionMa = correctionMa;
+    return (int16_t)correctionMa;
+}
+
 static HAL_StatusTypeDef Car_StopMotors(void)
 {
     HAL_StatusTypeDef status;
@@ -19,6 +83,7 @@ static HAL_StatusTypeDef Car_StopMotors(void)
     g_car.feedbackPriming = 0U;
     g_car.targetL = g_car.targetR = 0;
     g_lqr.currentMa = 0;
+    Car_ResetYawPid(g_mpu6050.yaw);
     status = Motor_StopPair();
     g_car.lastStopAttempt = HAL_GetTick();
     g_car.stopPending = status != HAL_OK;
@@ -34,6 +99,10 @@ static void Car_RetryStop(void)
 void Car_Init(void)
 {
     memset(&g_car, 0, sizeof(g_car));
+    g_car.yawPid.kp = YAW_PID_KP_DEFAULT;
+    g_car.yawPid.ki = YAW_PID_KI_DEFAULT;
+    g_car.yawPid.kd = YAW_PID_KD_DEFAULT;
+    g_car.yawPid.outputSign = 1.0f;
     LQR_Init();
     Motor_Init(&g_motor_left, MOTOR_LEFT_ID);
     Motor_Init(&g_motor_right, MOTOR_RIGHT_ID);
@@ -128,6 +197,7 @@ void Car_Enable(uint8_t enable)
     if (g_car.enabled || !g_car.canReady || g_car.stopPending) return;
     g_car.enabled = 1U;
     g_car.feedbackPriming = 1U;
+    Car_ResetYawPid(g_mpu6050.yaw);
     Motor_StartBalance();
 }
 
@@ -148,6 +218,8 @@ void Car_Control(void)
     float pitchRate;
     float gyroRateDps;
     float gyroBiasDps;
+    float yaw;
+    float yawRateDps;
     float position;
     float speed;
     float leftPositionDeg;
@@ -178,8 +250,10 @@ void Car_Control(void)
     taskENTER_CRITICAL();
     now = HAL_GetTick();
     pitch = g_mpu6050.pitch;
+    yaw = g_mpu6050.yaw;
     gyroRateDps = g_mpu6050.gyro_dps[1];
     gyroBiasDps = g_mpu6050.gyroBias[1];
+    yawRateDps = g_mpu6050.gyro_dps[2] - g_mpu6050.gyroBias[2];
     leftPositionDeg = g_motor_left.measuredPositionDeg;
     rightPositionDeg = g_motor_right.measuredPositionDeg;
     leftSpeedRpm = g_motor_left.measuredRpm;
@@ -236,8 +310,12 @@ void Car_Control(void)
         Car_SendBalancePair(0, 0);
         return;
     }
-    g_car.targetL = (int16_t)(MOTOR_LEFT_SIGN * g_lqr.currentMa);
-    g_car.targetR = (int16_t)(MOTOR_RIGHT_SIGN * g_lqr.currentMa);
+    {
+        int16_t yawCorrectionMa = Car_UpdateYawPid(yaw, yawRateDps);
+        /* Mix differential yaw current after LQR; preserve the balance-current budget. */
+        g_car.targetL = (int16_t)(MOTOR_LEFT_SIGN * (g_lqr.currentMa - yawCorrectionMa));
+        g_car.targetR = (int16_t)(MOTOR_RIGHT_SIGN * (g_lqr.currentMa + yawCorrectionMa));
+    }
     MotorBus_PollFeedback();
     Car_SendBalancePair(g_car.targetL, g_car.targetR);
 }

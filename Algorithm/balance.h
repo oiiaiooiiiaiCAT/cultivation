@@ -13,6 +13,24 @@
 #include "filter.h"
 #include "lqr.h"
 
+#define YAW_PID_MAX_CORRECTION_MA 250
+#define YAW_PID_KP_DEFAULT 8.0f
+#define YAW_PID_KI_DEFAULT 0.5f
+#define YAW_PID_KD_DEFAULT 0.15f
+#define YAW_PID_INTEGRAL_LIMIT_MA 120.0f
+
+typedef struct
+{
+    volatile float referenceDeg;
+    volatile float errorDeg;
+    volatile float integralMa;
+    volatile float correctionMa;
+    volatile float kp;
+    volatile float ki;
+    volatile float kd;
+    volatile float outputSign;    /* +1 or -1, set from the actual IMU/motor yaw direction. */
+} YawPid_TypeDef;
+
 typedef struct
 {
     LowPassFilter_TypeDef lpfPitchAcc;
@@ -24,6 +42,7 @@ typedef struct
     uint8_t stopPending;         /* 仅初始化或 START 失能请求发送失败时重试。 */
     uint8_t feedbackPriming;     /* 使能后等待新反馈，用当前位置重置参考值。 */
     uint32_t lastStopAttempt;
+    YawPid_TypeDef yawPid;        /* Heading target, PID gains and differential current. */
 } BalanceCar_TypeDef;
 
 extern BalanceCar_TypeDef g_car;
