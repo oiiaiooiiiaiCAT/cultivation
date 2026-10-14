@@ -1,0 +1,5 @@
+MDK-ARM/Balance_Car/
+MDK-ARM/*.uvguix.*
+MDK-ARM/DebugConfig/
+__pycache__/
+*.bak
