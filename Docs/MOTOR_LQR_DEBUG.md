@@ -2,6 +2,12 @@
 
 Motor addresses: left = 1, right = 2. No extra OLED page is added.
 
+Boot now automatically enables control once initialization, fresh feedback,
+safe stationary posture and a connected, centred controller permit it. START
+is not required for this first enable. CROSS cancels pending startup even while
+disabled. Manual stop, fault or failed transmission never automatically restarts;
+START is required to enable again. Reset/reflash can cause motor activation.
+
 ## Watch variables in Keil
 
 Expand `g_motor_left` and `g_motor_right`:

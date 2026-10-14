@@ -28,7 +28,7 @@ typedef struct
 } BalanceCar_TypeDef;
 
 extern BalanceCar_TypeDef g_car;
-/** @brief 调度器启动前初始化应用和外设，不自动使能电机。 */
+/** @brief 调度器启动前初始化；运行期条件满足后自动启动一次。 */
 void Car_Init(void);
 /** @brief 由 MPU 任务采样、融合并更新姿态，角度单位为 deg。 */
 void Car_ReadMPU(void);

@@ -13,6 +13,8 @@
 BalanceCar_TypeDef g_car;
 static uint16_t pendingButtons;
 static uint8_t pendingDisconnect;
+/* 仅上电允许一次自动启动；急停、手动停止和发送失败后不自动重启。 */
+static uint8_t startupPending;
 
 static uint8_t Car_SensorsSafe(void)
 {
@@ -28,6 +30,7 @@ static uint8_t Car_SensorsSafe(void)
 static HAL_StatusTypeDef Car_StopMotors(void)
 {
     HAL_StatusTypeDef status;
+    startupPending = 0U;
     g_car.enabled = 0U;
     g_car.feedbackPriming = 0U;
     g_car.targetL = g_car.targetR = 0;
@@ -72,6 +75,7 @@ void Car_Init(void)
     {
         g_car.faultCode = 2U;
     }
+    startupPending = g_car.faultCode == 0U;
 }
 
 void Car_ReadMPU(void)
@@ -161,6 +165,7 @@ void Car_Enable(uint8_t enable)
         !g_lqr.feedbackReady || !g_lqr.valid || !Car_SensorsSafe()) return;
     if (fabsf(g_lqr.state[2]) >= LQR_ARM_ANGLE_DEG * LQR_DEG_TO_RAD ||
         fabsf(g_lqr.state[1]) >= 0.05f || fabsf(g_lqr.state[3]) >= 0.25f) return;
+    startupPending = 0U;
     if (Motor_StartBalance() != HAL_OK)
     {
         Car_StopMotors();
@@ -208,8 +213,8 @@ void Car_Control(void)
     taskEXIT_CRITICAL();
     if (state.pressed & PS2_SELECT)
         g_oled.displayMode = (uint8_t)((g_oled.displayMode + 1U) % 3U);
-    if (g_car.enabled && ((state.pressed & PS2_START) ||
-        ((state.buttons | state.pressed) & PS2_CROSS)))
+    if (((state.buttons | state.pressed) & PS2_CROSS) ||
+        (g_car.enabled && (state.pressed & PS2_START)))
     {
         Car_Enable(0U);
         return;
@@ -280,7 +285,8 @@ void Car_Control(void)
         else MotorBus_PollFeedback();
         return;
     }
-    if ((state.pressed & PS2_START) && state.connected && !disconnected &&
+    if (!g_car.enabled && ((state.pressed & PS2_START) ||
+        (startupPending && g_car.faultCode == 0U)) && state.connected && !disconnected &&
         now - state.lastUpdate < PS2_TIMEOUT_MS &&
         PS2_NormalizeAxis(state.leftX, 128U) == 0 &&
         PS2_NormalizeAxis(state.leftY, 127U) == 0 &&
@@ -379,7 +385,8 @@ void Car_Display(void)
     OLED_ShowString(&g_oled, 1U, 1U,
         fault ? "LQR FAULT:00    " : enabled ?
         (g_car.feedbackPriming ? "LQR WAIT FB     " : "LQR RUN         ") :
-        g_lqr.feedbackReady ? (g_lqr.outputAllowed ? "LQR READY START " : "LQR SHADOW READY") :
+        g_lqr.feedbackReady ? (g_lqr.outputAllowed ?
+            (startupPending ? "LQR WAIT SAFE   " : "LQR STOPPED     ") : "LQR SHADOW READY") :
                               "LQR WAIT FB     ");
     OLED_ShowString(&g_oled, 2U, 1U, "P:      R:      ");
     OLED_ShowSignedNum(&g_oled, 2U, 3U, (int32_t)pitch, 3U);
