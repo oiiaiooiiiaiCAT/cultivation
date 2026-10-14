@@ -21,12 +21,16 @@ Each control iteration queries one item, rotating left speed, right speed,
 left position, right position. Nominal full rotation is 16 ms at a 4 ms period;
 actual timing must be checked on hardware.
 
-The asynchronous transmit bookkeeping is no longer used in the normal control
-path. Commands use bounded mailbox/transmit waits without waiting for command
+The obsolete asynchronous transmit bookkeeping has been removed.
+Commands use bounded mailbox/transmit waits without waiting for command
 response acknowledgements. Feedback older than 50 ms produces zero current and
 continues querying; it does not latch FAULT 05. Fresh feedback resumes control.
 IMU, excessive tilt/speed/displacement, controller disconnect and CROSS stop
 protection remain. This is not a removal of every safety condition.
+
+If either wheel's current command fails to transmit, both wheels are stopped
+using the existing stop/retry path. This does not latch a communication fault,
+but START is required to enable control again; it is not automatic recovery.
 
 ## What LQR needs
 

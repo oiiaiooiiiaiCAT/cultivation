@@ -1,21 +1,21 @@
+/**
+ * @file    motor.c
+ * @brief   EMM-V5 CAN command TX and interrupt feedback decoding; no LQR.
+ */
+#include <string.h>
+
 #include "motor.h"
 #include "FreeRTOS.h"
 #include "task.h"
 
 Motor_TypeDef g_motor_left;
 Motor_TypeDef g_motor_right;
-Motor_BalanceDiagnosticTypeDef g_motor_balance_diag;
 Motor_BusTypeDef g_motor_bus;
-Motor_CurrentTestTypeDef g_motor_current_test = {
-    .leftCurrentMa = MOTOR_CURRENT_TEST_LEFT_MA,
-    .rightCurrentMa = MOTOR_CURRENT_TEST_RIGHT_MA
-};
-#include <string.h>
-
 static CAN_HandleTypeDef *motorCan;
 static Motor_TypeDef *registeredMotors[2];
 static volatile uint32_t completedMailboxes;
 static volatile uint32_t failedMailboxes;
+static volatile uint32_t mailboxErrors[3];
 
 static HAL_StatusTypeDef Motor_RecordTxFailure(Motor_TypeDef *motor,
                                                uint8_t function, HAL_StatusTypeDef status)
@@ -28,6 +28,10 @@ static HAL_StatusTypeDef Motor_RecordTxFailure(Motor_TypeDef *motor,
     return status;
 }
 
+/* Extended ID = (address << 8) | packet; payload starts with function.
+ * Control-task only: waits for CAN TX completion, not motor acknowledgement.
+ * Tick and loop limits bound the wait; never call inside a critical section.
+ */
 static HAL_StatusTypeDef Motor_Send(Motor_TypeDef *motor,
                                     const uint8_t *command, uint8_t length)
 {
@@ -39,7 +43,7 @@ static HAL_StatusTypeDef Motor_Send(Motor_TypeDef *motor,
     uint32_t started;
     uint32_t waitLoops;
     HAL_StatusTypeDef status;
-    if (motor == NULL || motorCan == NULL || motor->address == 0U || length < 3U)
+    if (motor == NULL || motorCan == NULL || motor->address == 0U || command == NULL || length < 3U)
         return HAL_ERROR;
     motor->commandTxError = HAL_CAN_ERROR_NONE;
     while (offset < length)
@@ -62,7 +66,7 @@ static HAL_StatusTypeDef Motor_Send(Motor_TypeDef *motor,
         }
         completedMailboxes = 0U;
         failedMailboxes = 0U;
-        g_motor_bus.tx[0].error = g_motor_bus.tx[1].error = g_motor_bus.tx[2].error = 0U;
+        mailboxErrors[0] = mailboxErrors[1] = mailboxErrors[2] = 0U;
         HAL_CAN_ResetError(motorCan);
         status = HAL_CAN_AddTxMessage(motorCan, &header, payload, &mailbox);
         if (status != HAL_OK)
@@ -76,7 +80,7 @@ static HAL_StatusTypeDef Motor_Send(Motor_TypeDef *motor,
             if ((failedMailboxes & mailbox) != 0U)
             {
                 uint8_t slot = mailbox == CAN_TX_MAILBOX0 ? 0U : mailbox == CAN_TX_MAILBOX1 ? 1U : 2U;
-                motor->commandTxError = g_motor_bus.tx[slot].error;
+                motor->commandTxError = mailboxErrors[slot];
                 return Motor_RecordTxFailure(motor, command[1], HAL_ERROR);
             }
             if (HAL_GetTick() - started >= MOTOR_TX_TIMEOUT_MS ||
@@ -97,57 +101,6 @@ static HAL_StatusTypeDef Motor_Send(Motor_TypeDef *motor,
     }
     motor->lastStatus = HAL_OK;
     return HAL_OK;
-}
-
-static HAL_StatusTypeDef Motor_SendConfirmed(Motor_TypeDef *motor,
-                                             const uint8_t *command, uint8_t length)
-{
-    uint32_t started;
-    HAL_StatusTypeDef status;
-    motor->confirmFunction = command[1];
-    motor->confirmCode = 0U;
-    motor->confirmReceived = 0U;
-    motor->confirmWaiting = 1U;
-    status = Motor_Send(motor, command, length);
-    if (status == HAL_OK)
-    {
-        started = HAL_GetTick();
-        status = HAL_TIMEOUT;
-        while (HAL_GetTick() - started < MOTOR_CONFIRM_TIMEOUT_MS)
-        {
-            if (motor->confirmReceived)
-            {
-                status = motor->confirmCode == 0x02U ? HAL_OK : HAL_ERROR;
-                break;
-            }
-        }
-    }
-    motor->confirmWaiting = 0U;
-    motor->lastStatus = status;
-    return status;
-}
-
-static HAL_StatusTypeDef Motor_StartCommandConfirmed(Motor_TypeDef *motor,
-                                                     const uint8_t *command, uint8_t length)
-{
-    HAL_StatusTypeDef status = HAL_ERROR;
-    motor->confirmAttempts = 0U;
-    while (motor->confirmAttempts < MOTOR_START_CONFIRM_ATTEMPTS)
-    {
-        motor->confirmAttempts++;
-        status = Motor_SendConfirmed(motor, command, length);
-        if (status != HAL_TIMEOUT || motor->commandTxError != HAL_CAN_ERROR_NONE) break;
-        if (motor->confirmAttempts < MOTOR_START_CONFIRM_ATTEMPTS) HAL_Delay(2U);
-    }
-    return status;
-}
-
-static HAL_StatusTypeDef Motor_EnableConfirmed(Motor_TypeDef *motor)
-{
-    const uint8_t command[] = {0U, 0xF3U, 0xABU, 1U, 0U, 0x6BU};
-    HAL_StatusTypeDef status = Motor_StartCommandConfirmed(motor, command, sizeof(command));
-    motor->enableAttempts = motor->confirmAttempts;
-    return status;
 }
 
 HAL_StatusTypeDef MotorBus_Init(CAN_HandleTypeDef *handle)
@@ -183,8 +136,9 @@ HAL_StatusTypeDef MotorBus_CancelPending(void)
     uint32_t waitLoops = 0U;
     uint8_t index;
     if (motorCan == NULL) return HAL_ERROR;
+    /* Check hardware mailboxes; normal TX no longer marks legacy active flags. */
     for (index = 0U; index < 3U; index++)
-        if (g_motor_bus.tx[index].active) mask |= 1UL << index;
+        if (HAL_CAN_IsTxMessagePending(motorCan, 1UL << index)) mask |= 1UL << index;
     if (mask != 0U && HAL_CAN_IsTxMessagePending(motorCan, mask))
     {
         if (HAL_CAN_AbortTxRequest(motorCan, mask) != HAL_OK) return HAL_ERROR;
@@ -197,12 +151,9 @@ HAL_StatusTypeDef MotorBus_CancelPending(void)
         }
     }
     taskENTER_CRITICAL();
-    for (index = 0U; index < 3U; index++) g_motor_bus.tx[index].active = 0U;
     completedMailboxes &= ~mask;
     failedMailboxes &= ~mask;
     taskEXIT_CRITICAL();
-    g_motor_left.feedback[0].pending = g_motor_left.feedback[1].pending = 0U;
-    g_motor_right.feedback[0].pending = g_motor_right.feedback[1].pending = 0U;
     return HAL_OK;
 }
 
@@ -211,23 +162,17 @@ void Motor_ResetFeedback(void)
     taskENTER_CRITICAL();
     g_motor_left.speedValid = g_motor_right.speedValid = 0U;
     g_motor_left.positionValid = g_motor_right.positionValid = 0U;
-    g_motor_left.feedback[0].pending = g_motor_left.feedback[1].pending = 0U;
-    g_motor_right.feedback[0].pending = g_motor_right.feedback[1].pending = 0U;
     taskEXIT_CRITICAL();
     g_motor_bus.feedbackCursor = 0U;
 }
 
-HAL_StatusTypeDef MotorBus_Service(void)
-{
-    return HAL_OK;
-}
-
+/* One query per call: left speed, right speed, left position, right position. */
 HAL_StatusTypeDef MotorBus_PollFeedback(void)
 {
     uint8_t slot = g_motor_bus.feedbackCursor;
     HAL_StatusTypeDef status = Motor_RequestFeedback(
         slot & 1U ? &g_motor_right : &g_motor_left,
-        slot < 2U ? 0x35U : 0x36U);
+        slot < 2U ? MOTOR_CMD_SPEED_QUERY : MOTOR_CMD_POSITION_QUERY);
     if (status == HAL_OK)
         g_motor_bus.feedbackCursor = (uint8_t)((slot + 1U) % 4U);
     return status;
@@ -236,8 +181,10 @@ HAL_StatusTypeDef MotorBus_PollFeedback(void)
 void Motor_Init(Motor_TypeDef *motor, uint8_t address)
 {
     uint8_t index;
+    if (motor == NULL || address == 0U) return;
     memset(motor, 0, sizeof(*motor));
     motor->address = address;
+    motor->forwardSign = address == MOTOR_LEFT_ID ? MOTOR_LEFT_SIGN : MOTOR_RIGHT_SIGN;
     for (index = 0U; index < 2U; index++)
     {
         if (registeredMotors[index] == NULL)
@@ -250,14 +197,14 @@ void Motor_Init(Motor_TypeDef *motor, uint8_t address)
 
 HAL_StatusTypeDef Motor_Enable(Motor_TypeDef *motor, uint8_t enable)
 {
-    const uint8_t command[] = {0U, 0xF3U, 0xABU, enable ? 1U : 0U, 0U, 0x6BU};
+    const uint8_t command[] = {0U, MOTOR_CMD_ENABLE, 0xABU, enable ? 1U : 0U, 0U, MOTOR_FRAME_END};
     return Motor_Send(motor, command, sizeof(command));
 }
 
 HAL_StatusTypeDef Motor_SetSpeed(Motor_TypeDef *motor, int16_t rpm)
 {
     uint16_t magnitude;
-    uint8_t command[] = {0U, 0xF6U, 0U, 0U, 0U, MOTOR_ACCELERATION, 0U, 0x6BU};
+    uint8_t command[] = {0U, MOTOR_CMD_SPEED, 0U, 0U, 0U, MOTOR_ACCELERATION, 0U, MOTOR_FRAME_END};
     HAL_StatusTypeDef status;
     if (rpm > MOTOR_MAX_RPM) rpm = MOTOR_MAX_RPM;
     if (rpm < -MOTOR_MAX_RPM) rpm = -MOTOR_MAX_RPM;
@@ -274,7 +221,7 @@ HAL_StatusTypeDef Motor_SetCurrent(Motor_TypeDef *motor, int16_t currentMa)
 {
     uint16_t magnitude;
     uint16_t speedLimit = MOTOR_CURRENT_MAX_RPM * 10U;
-    uint8_t command[] = {0U, 0xC5U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0x6BU};
+    uint8_t command[] = {0U, 0xC5U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, MOTOR_FRAME_END};
     HAL_StatusTypeDef status;
     if (currentMa > MOTOR_CURRENT_LIMIT_MA) currentMa = MOTOR_CURRENT_LIMIT_MA;
     if (currentMa < -MOTOR_CURRENT_LIMIT_MA) currentMa = -MOTOR_CURRENT_LIMIT_MA;
@@ -293,7 +240,7 @@ HAL_StatusTypeDef Motor_SetCurrent(Motor_TypeDef *motor, int16_t currentMa)
 
 HAL_StatusTypeDef Motor_SetHeartbeat(Motor_TypeDef *motor, uint32_t timeoutMs)
 {
-    uint8_t command[] = {0U, 0x68U, 0x38U, 0U, 0U, 0U, 0U, 0U, 0x6BU};
+    uint8_t command[] = {0U, MOTOR_CMD_HEARTBEAT, 0x38U, 0U, 0U, 0U, 0U, 0U, MOTOR_FRAME_END};
     command[4] = (uint8_t)(timeoutMs >> 24);
     command[5] = (uint8_t)(timeoutMs >> 16);
     command[6] = (uint8_t)(timeoutMs >> 8);
@@ -304,7 +251,7 @@ HAL_StatusTypeDef Motor_SetHeartbeat(Motor_TypeDef *motor, uint32_t timeoutMs)
 HAL_StatusTypeDef Motor_SetBalanceCurrent(Motor_TypeDef *motor, int16_t currentMa)
 {
     uint16_t magnitude;
-    uint8_t command[] = {0U, 0xF5U, 0U, 0xFFU, 0xFFU, 0U, 0U, 0U, 0x6BU};
+    uint8_t command[] = {0U, MOTOR_CMD_CURRENT, 0U, 0xFFU, 0xFFU, 0U, 0U, 0U, MOTOR_FRAME_END};
     HAL_StatusTypeDef status;
     if (currentMa > MOTOR_CURRENT_LIMIT_MA) currentMa = MOTOR_CURRENT_LIMIT_MA;
     if (currentMa < -MOTOR_CURRENT_LIMIT_MA) currentMa = -MOTOR_CURRENT_LIMIT_MA;
@@ -323,71 +270,19 @@ HAL_StatusTypeDef Motor_SetBalanceCurrent(Motor_TypeDef *motor, int16_t currentM
 
 HAL_StatusTypeDef Motor_RequestFeedback(Motor_TypeDef *motor, uint8_t function)
 {
-    uint8_t command[] = {0U, function, 0x6BU};
+    uint8_t command[] = {0U, function, MOTOR_FRAME_END};
     Motor_FeedbackTypeDef *feedback;
     HAL_StatusTypeDef status;
-    if (motor == NULL || (function != 0x35U && function != 0x36U)) return HAL_ERROR;
-    feedback = &motor->feedback[function == 0x35U ? 0U : 1U];
+    if (motor == NULL || (function != MOTOR_CMD_SPEED_QUERY && function != MOTOR_CMD_POSITION_QUERY)) return HAL_ERROR;
+    feedback = &motor->feedback[function == MOTOR_CMD_SPEED_QUERY ? 0U : 1U];
     feedback->requestedAt = HAL_GetTick();
     status = Motor_Send(motor, command, sizeof(command));
     if (status == HAL_OK) feedback->requestCount++;
     else
     {
-        feedback->pending = 0U;
         if (status != HAL_BUSY) feedback->txFailureCount++;
     }
     return status;
-}
-
-void Motor_RecordBalanceFailure(uint8_t faultCode, uint8_t stage, uint8_t function,
-                               HAL_StatusTypeDef leftStatus, HAL_StatusTypeDef rightStatus,
-                               uint8_t reason)
-{
-    uint32_t now = HAL_GetTick();
-    uint8_t index;
-    g_motor_balance_diag.capturedAt = now;
-    g_motor_balance_diag.faultCode = faultCode;
-    g_motor_balance_diag.stage = stage;
-    g_motor_balance_diag.function = function;
-    g_motor_balance_diag.reason = reason;
-    g_motor_balance_diag.leftStatus = leftStatus;
-    g_motor_balance_diag.rightStatus = rightStatus;
-    g_motor_balance_diag.leftTxError = g_motor_left.commandTxError;
-    g_motor_balance_diag.rightTxError = g_motor_right.commandTxError;
-    g_motor_balance_diag.leftAckAgeMs = now - g_motor_left.currentAcceptedAt;
-    g_motor_balance_diag.rightAckAgeMs = now - g_motor_right.currentAcceptedAt;
-    g_motor_balance_diag.leftSpeedAgeMs = now - g_motor_left.speedUpdatedAt;
-    g_motor_balance_diag.rightSpeedAgeMs = now - g_motor_right.speedUpdatedAt;
-    g_motor_balance_diag.leftPositionAgeMs = now - g_motor_left.positionUpdatedAt;
-    g_motor_balance_diag.rightPositionAgeMs = now - g_motor_right.positionUpdatedAt;
-    g_motor_balance_diag.leftEnableAttempts = g_motor_left.enableAttempts;
-    g_motor_balance_diag.rightEnableAttempts = g_motor_right.enableAttempts;
-    g_motor_balance_diag.leftConfirmAttempts = g_motor_left.confirmAttempts;
-    g_motor_balance_diag.rightConfirmAttempts = g_motor_right.confirmAttempts;
-    for (index = 0U; index < 4U; index++)
-    {
-        Motor_TypeDef *motor = index & 1U ? &g_motor_right : &g_motor_left;
-        Motor_FeedbackTypeDef *feedback = &motor->feedback[index < 2U ? 0U : 1U];
-        g_motor_balance_diag.feedbackRequests[index] = feedback->requestCount;
-        g_motor_balance_diag.feedbackReplies[index] = feedback->replyCount;
-        g_motor_balance_diag.feedbackMisses[index] = feedback->missedReplyCount;
-        g_motor_balance_diag.feedbackTxFailures[index] = feedback->txFailureCount;
-    }
-    if (stage <= MOTOR_BALANCE_STAGE_ZERO_CURRENT)
-    {
-        g_motor_balance_diag.leftReplyCode = g_motor_left.confirmCode;
-        g_motor_balance_diag.rightReplyCode = g_motor_right.confirmCode;
-    }
-    else if (function == 0xF5U)
-    {
-        g_motor_balance_diag.leftReplyCode = g_motor_left.currentReplyCode;
-        g_motor_balance_diag.rightReplyCode = g_motor_right.currentReplyCode;
-    }
-    else
-    {
-        g_motor_balance_diag.leftReplyCode = g_motor_left.replyCode;
-        g_motor_balance_diag.rightReplyCode = g_motor_right.replyCode;
-    }
 }
 
 HAL_StatusTypeDef Motor_StartBalance(void)
@@ -407,7 +302,7 @@ HAL_StatusTypeDef Motor_StartBalance(void)
 
 HAL_StatusTypeDef Motor_Stop(Motor_TypeDef *motor)
 {
-    const uint8_t command[] = {0U, 0xFEU, 0x98U, 0U, 0x6BU};
+    const uint8_t command[] = {0U, MOTOR_CMD_STOP, 0x98U, 0U, MOTOR_FRAME_END};
     HAL_StatusTypeDef status = Motor_Send(motor, command, sizeof(command));
     if (status == HAL_OK)
     {
@@ -430,109 +325,20 @@ static HAL_StatusTypeDef Motor_StopOrDisableRetry(Motor_TypeDef *motor, uint8_t 
     return status;
 }
 
+/** @brief Abort queued TX, stop both motors, then disable both drivers. */
 HAL_StatusTypeDef Motor_StopPair(void)
 {
     HAL_StatusTypeDef leftStop;
     HAL_StatusTypeDef rightStop;
     HAL_StatusTypeDef leftDisable;
     HAL_StatusTypeDef rightDisable;
-    if (MotorBus_CancelPending() != HAL_OK)
-    {
-        g_motor_current_test.stopPending = 1U;
-        return HAL_ERROR;
-    }
+    if (MotorBus_CancelPending() != HAL_OK) return HAL_ERROR;
     leftStop = Motor_StopOrDisableRetry(&g_motor_left, 0U);
     rightStop = Motor_StopOrDisableRetry(&g_motor_right, 0U);
     leftDisable = Motor_StopOrDisableRetry(&g_motor_left, 1U);
     rightDisable = Motor_StopOrDisableRetry(&g_motor_right, 1U);
-    g_motor_current_test.lastStopAttempt = HAL_GetTick();
-    g_motor_current_test.stopPending = leftStop != HAL_OK || rightStop != HAL_OK ||
-                                      leftDisable != HAL_OK || rightDisable != HAL_OK;
-    if (g_motor_current_test.stopPending)
-    {
-        g_motor_current_test.fault = 1U;
-        if (g_motor_current_test.failureStage == 0U)
-        {
-            g_motor_current_test.failureStage = 5U;
-            g_motor_current_test.failureLeftStopStatus = leftStop;
-            g_motor_current_test.failureRightStopStatus = rightStop;
-            g_motor_current_test.failureLeftDisableStatus = leftDisable;
-            g_motor_current_test.failureRightDisableStatus = rightDisable;
-            g_motor_current_test.failureLeftStatus = leftStop != HAL_OK ? leftStop : leftDisable;
-            g_motor_current_test.failureRightStatus = rightStop != HAL_OK ? rightStop : rightDisable;
-        }
-    }
-    return g_motor_current_test.stopPending ? HAL_ERROR : HAL_OK;
-}
-
-void Motor_CurrentTestStop(void)
-{
-    g_motor_current_test.active = 0U;
-    g_motor_current_test.finished = 1U;
-    Motor_StopPair();
-}
-
-void Motor_CurrentTestUpdate(uint8_t busReady)
-{
-    HAL_StatusTypeDef leftStatus;
-    HAL_StatusTypeDef rightStatus;
-    if (g_motor_current_test.finished)
-    {
-        if (busReady && g_motor_current_test.stopPending &&
-            HAL_GetTick() - g_motor_current_test.lastStopAttempt >= 200U)
-            Motor_CurrentTestStop();
-        return;
-    }
-    if (!busReady)
-    {
-        g_motor_current_test.failureStage = 1U;
-        g_motor_current_test.failureLeftStatus = HAL_ERROR;
-        g_motor_current_test.failureRightStatus = HAL_ERROR;
-        g_motor_current_test.fault = 1U;
-        g_motor_current_test.finished = 1U;
-        return;
-    }
-    if (g_motor_current_test.fault) goto failed;
-    if (!g_motor_current_test.active)
-    {
-        leftStatus = Motor_SetHeartbeat(&g_motor_left, MOTOR_CURRENT_HEARTBEAT_MS);
-        rightStatus = Motor_SetHeartbeat(&g_motor_right, MOTOR_CURRENT_HEARTBEAT_MS);
-        if (leftStatus != HAL_OK || rightStatus != HAL_OK)
-        {
-            g_motor_current_test.failureStage = 2U;
-            g_motor_current_test.failureLeftStatus = leftStatus;
-            g_motor_current_test.failureRightStatus = rightStatus;
-            goto failed;
-        }
-        leftStatus = Motor_EnableConfirmed(&g_motor_left);
-        rightStatus = Motor_EnableConfirmed(&g_motor_right);
-        if (leftStatus != HAL_OK || rightStatus != HAL_OK)
-        {
-            g_motor_current_test.failureStage = 3U;
-            g_motor_current_test.failureLeftStatus = leftStatus;
-            g_motor_current_test.failureRightStatus = rightStatus;
-            goto failed;
-        }
-        g_motor_current_test.startedAt = HAL_GetTick();
-        g_motor_current_test.active = 1U;
-    }
-    if (HAL_GetTick() - g_motor_current_test.startedAt >= MOTOR_CURRENT_TEST_DURATION_MS)
-    {
-        Motor_CurrentTestStop();
-        return;
-    }
-    leftStatus = Motor_SetCurrent(&g_motor_left, g_motor_current_test.leftCurrentMa);
-    rightStatus = Motor_SetCurrent(&g_motor_right, g_motor_current_test.rightCurrentMa);
-    if (leftStatus == HAL_OK && rightStatus == HAL_OK) return;
-    if (g_motor_current_test.failureStage == 0U)
-    {
-        g_motor_current_test.failureStage = 4U;
-        g_motor_current_test.failureLeftStatus = leftStatus;
-        g_motor_current_test.failureRightStatus = rightStatus;
-    }
-failed:
-    g_motor_current_test.fault = 1U;
-    Motor_CurrentTestStop();
+    return leftStop == HAL_OK && rightStop == HAL_OK &&
+           leftDisable == HAL_OK && rightDisable == HAL_OK ? HAL_OK : HAL_ERROR;
 }
 
 HAL_StatusTypeDef Motor_SetPosition(Motor_TypeDef *motor, uint8_t direction,
@@ -540,7 +346,7 @@ HAL_StatusTypeDef Motor_SetPosition(Motor_TypeDef *motor, uint8_t direction,
                                    uint32_t pulses, uint8_t absolute)
 {
     uint8_t command[] = {0U, 0xFDU, direction, 0U, 0U, acceleration,
-                        0U, 0U, 0U, 0U, absolute, 0U, 0x6BU};
+                        0U, 0U, 0U, 0U, absolute, 0U, MOTOR_FRAME_END};
     if (direction > 1U || absolute > 1U || rpm > MOTOR_MAX_RPM) return HAL_ERROR;
     command[3] = (uint8_t)(rpm >> 8);
     command[4] = (uint8_t)rpm;
@@ -594,7 +400,7 @@ void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *handle)
         if (error & arbitration[index]) g_motor_bus.arbitrationLossCount++;
         if (error & (arbitration[index] | transmit[index]))
         {
-            g_motor_bus.tx[index].error |= error & (arbitration[index] | transmit[index]);
+            mailboxErrors[index] |= error & (arbitration[index] | transmit[index]);
             failedMailboxes |= 1UL << index;
         }
     }
@@ -608,15 +414,10 @@ static void Motor_FeedbackReceived(Motor_TypeDef *motor, uint8_t index)
     uint32_t now = HAL_GetTick();
     feedback->replyCount++;
     feedback->receivedAt = now;
-    if (feedback->pending)
-    {
-        feedback->lastRoundTripMs = now - feedback->requestedAt;
-        if (feedback->lastRoundTripMs > feedback->maxRoundTripMs)
-            feedback->maxRoundTripMs = feedback->lastRoundTripMs;
-        feedback->pending = 0U;
-    }
+
 }
 
+/* ISR validates frames and updates measurements only; no control or TX waits. */
 void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *handle)
 {
     CAN_RxHeaderTypeDef header;
@@ -638,13 +439,13 @@ void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *handle)
                 motor->rxCount++;
                 motor->lastRxAt = HAL_GetTick();
                 motor->lastRxPacket = header.ExtId & 0xFFU;
-                if (header.DLC && (payload[0] == 0x35U || payload[0] == 0x36U) &&
+                if (header.DLC && (payload[0] == MOTOR_CMD_SPEED_QUERY || payload[0] == MOTOR_CMD_POSITION_QUERY) &&
                     !((header.ExtId & 0xFFU) == 0U &&
-                      ((payload[0] == 0x35U && header.DLC == 5U && payload[1] <= 1U && payload[4] == 0x6BU) ||
-                       (payload[0] == 0x36U && header.DLC == 7U && payload[1] <= 1U && payload[6] == 0x6BU))))
+                      ((payload[0] == MOTOR_CMD_SPEED_QUERY && header.DLC == 5U && payload[1] <= 1U && payload[4] == MOTOR_FRAME_END) ||
+                       (payload[0] == MOTOR_CMD_POSITION_QUERY && header.DLC == 7U && payload[1] <= 1U && payload[6] == MOTOR_FRAME_END))))
                     motor->malformedRxCount++;
                 if ((header.ExtId & 0xFFU) == 0U && header.DLC == 5U &&
-                    payload[0] == 0x35U && payload[1] <= 1U && payload[4] == 0x6BU)
+                    payload[0] == MOTOR_CMD_SPEED_QUERY && payload[1] <= 1U && payload[4] == MOTOR_FRAME_END)
                 {
                     uint16_t magnitude = ((uint16_t)payload[2] << 8) | payload[3];
                     motor->measuredRpm = (float)magnitude * (payload[1] ? -0.1f : 0.1f);
@@ -656,7 +457,7 @@ void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *handle)
                     Motor_FeedbackReceived(motor, 0U);
                 }
                 if ((header.ExtId & 0xFFU) == 0U && header.DLC == 7U &&
-                    payload[0] == 0x36U && payload[1] <= 1U && payload[6] == 0x6BU)
+                    payload[0] == MOTOR_CMD_POSITION_QUERY && payload[1] <= 1U && payload[6] == MOTOR_FRAME_END)
                 {
                     uint32_t magnitude = ((uint32_t)payload[2] << 24) |
                         ((uint32_t)payload[3] << 16) | ((uint32_t)payload[4] << 8) | payload[5];
@@ -668,20 +469,12 @@ void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *handle)
                     motor->positionValid = 1U;
                     Motor_FeedbackReceived(motor, 1U);
                 }
-                if ((header.ExtId & 0xFFU) == 0U && header.DLC == 3U && payload[2] == 0x6BU)
+                if ((header.ExtId & 0xFFU) == 0U && header.DLC == 3U && payload[2] == MOTOR_FRAME_END)
                 {
                     motor->replyFunction = payload[0];
                     motor->replyCode = payload[1];
                     motor->replyCount++;
-                    if (motor->confirmWaiting && payload[0] == motor->confirmFunction &&
-                        (payload[1] == 0x02U || payload[1] == 0x12U || payload[1] == 0x22U ||
-                         payload[1] == 0xE2U || payload[1] == 0xEEU) &&
-                        (!motor->confirmReceived || payload[1] != 0x02U))
-                    {
-                        motor->confirmCode = payload[1];
-                        motor->confirmReceived = 1U;
-                    }
-                    if (payload[0] == 0xF5U || payload[0] == 0xC5U)
+                    if (payload[0] == MOTOR_CMD_CURRENT || payload[0] == 0xC5U)
                     {
                         if (payload[1] == 0x02U)
                         {
@@ -697,17 +490,6 @@ void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *handle)
                             motor->commandRejected = 1U;
                             motor->lastRejectedFunction = payload[0];
                         }
-                    }
-                    if (payload[0] == 0xC5U &&
-                        (payload[1] == 0xE2U || payload[1] == 0xEEU))
-                    {
-                        if (g_motor_current_test.failureStage == 0U)
-                            g_motor_current_test.failureStage = 4U;
-                        if (motor == &g_motor_left)
-                            g_motor_current_test.failureLeftStatus = HAL_ERROR;
-                        else
-                            g_motor_current_test.failureRightStatus = HAL_ERROR;
-                        g_motor_current_test.fault = 1U;
                     }
                 }
             }

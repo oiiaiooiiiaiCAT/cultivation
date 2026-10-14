@@ -1,3 +1,7 @@
+/**
+ * @file    lqr.c
+ * @brief   构造四状态、计算 u=-Kx、限幅并转换电流指令；不负责 CAN 通信。
+ */
 #include "lqr.h"
 #include <math.h>
 #include <string.h>
@@ -7,6 +11,7 @@ LQR_TypeDef g_lqr;
 void LQR_Init(void)
 {
     memset(&g_lqr, 0, sizeof(g_lqr));
+    /* K 应离线由实际机械参数和电流输入模型求得；现有值仍需实车验证。 */
     g_lqr.gain[0] = -0.12822586f;
     g_lqr.gain[1] = -0.25494726f;
     g_lqr.gain[2] = -1.33878598f;
@@ -63,6 +68,7 @@ uint8_t LQR_Update(float positionM, float speedMps, float pitchDeg, float pitchR
     g_lqr.saturated = 0U;
     if (!isfinite(positionM) || !isfinite(speedMps) ||
         !isfinite(pitchDeg) || !isfinite(pitchRateDps)) return 0U;
+    /* Convert IMU angles to the model radian convention at this boundary. */
     g_lqr.state[0] = positionM - g_lqr.positionReference;
     g_lqr.state[1] = speedMps;
     g_lqr.state[2] = pitchDeg * LQR_DEG_TO_RAD;
@@ -71,6 +77,7 @@ uint8_t LQR_Update(float positionM, float speedMps, float pitchDeg, float pitchR
     {
         if (!isfinite(g_lqr.state[index])) return 0U;
     }
+    /* Current output is A; K must use a current-input discrete model. */
     for (index = 0U; index < 4U; index++)
     {
         if (!isfinite(g_lqr.gain[index])) return 0U;

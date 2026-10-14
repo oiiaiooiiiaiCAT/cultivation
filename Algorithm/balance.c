@@ -1,3 +1,7 @@
+/**
+ * @file    balance.c
+ * @brief   传感器快照、LQR 状态构造、安全检查和双轮输出编排。
+ */
 #include "balance.h"
 #include "i2c.h"
 #include "can.h"
@@ -172,15 +176,18 @@ void Car_Enable(uint8_t enable)
     g_car.enabled = 1U;
     Motor_ResetFeedback();
     g_car.feedbackPriming = 1U;
-    g_car.feedbackPrimingStartedAt = HAL_GetTick();
     g_lqr.lastControlTick = HAL_GetTick();
 }
 
+/* 双轮发送不是原子操作；任一失败都进入统一停机，避免单轮持续输出。 */
 static uint8_t Car_SendBalancePair(int16_t leftCurrent, int16_t rightCurrent)
 {
-    Motor_SetBalanceCurrent(&g_motor_left, leftCurrent);
-    Motor_SetBalanceCurrent(&g_motor_right, rightCurrent);
-    return 1U;
+    HAL_StatusTypeDef leftStatus = Motor_SetBalanceCurrent(&g_motor_left, leftCurrent);
+    HAL_StatusTypeDef rightStatus = Motor_SetBalanceCurrent(&g_motor_right, rightCurrent);
+    if (leftStatus == HAL_OK && rightStatus == HAL_OK) return 1U;
+    /* 复用停机重试路径，不锁存通信故障；再次启动仍需按 START。 */
+    Car_StopMotors();
+    return 0U;
 }
 
 void Car_Control(void)
@@ -193,8 +200,16 @@ void Car_Control(void)
     uint32_t now = HAL_GetTick();
     float pitch;
     float pitchRate;
+    float gyroRateDps;
+    float gyroBiasDps;
     float position;
     float speed;
+    float leftPositionDeg;
+    float rightPositionDeg;
+    float leftSpeedRpm;
+    float rightSpeedRpm;
+    uint32_t feedbackUpdatedAt[4];
+    uint8_t feedbackValid[4];
     g_lqr.positionStepM = 0.0f;
     g_lqr.referenceSpeedMps = 0.0f;
     taskENTER_CRITICAL();
@@ -206,13 +221,6 @@ void Car_Control(void)
     taskEXIT_CRITICAL();
     if (state.pressed & PS2_SELECT)
         g_oled.displayMode = (uint8_t)((g_oled.displayMode + 1U) % 3U);
-#if MOTOR_CURRENT_TEST_ENABLED
-    if ((state.buttons | state.pressed) & PS2_CROSS) Motor_CurrentTestStop();
-    else Motor_CurrentTestUpdate(g_car.canReady);
-    g_car.enabled = g_motor_current_test.active;
-    g_car.fault = g_motor_current_test.fault;
-    return;
-#endif
     if (g_car.enabled && ((state.pressed & PS2_START) ||
         ((state.buttons | state.pressed) & PS2_CROSS)))
     {
@@ -226,32 +234,42 @@ void Car_Control(void)
         Car_RetryStop();
         return;
     }
-    MotorBus_Service();
     g_lqr.lastControlTick = now;
     taskENTER_CRITICAL();
     now = HAL_GetTick();
     pitch = g_mpu6050.pitch;
-    pitchRate = LQR_PITCH_RATE_SIGN * (g_mpu6050.gyro_dps[1] - g_mpu6050.gyroBias[1]);
+    gyroRateDps = g_mpu6050.gyro_dps[1];
+    gyroBiasDps = g_mpu6050.gyroBias[1];
+    leftPositionDeg = g_motor_left.measuredPositionDeg;
+    rightPositionDeg = g_motor_right.measuredPositionDeg;
+    leftSpeedRpm = g_motor_left.measuredRpm;
+    rightSpeedRpm = g_motor_right.measuredRpm;
+    for (index = 0U; index < 4U; index++)
+    {
+        Motor_TypeDef *motor = index & 1U ? &g_motor_right : &g_motor_left;
+        feedbackValid[index] = index < 2U ? motor->speedValid : motor->positionValid;
+        feedbackUpdatedAt[index] = index < 2U ? motor->speedUpdatedAt : motor->positionUpdatedAt;
+    }
+    taskEXIT_CRITICAL();
+    /* 临界区只复制一致快照；浮点换算放在区外，缩短 CAN 中断屏蔽时间。 */
+    pitchRate = LQR_PITCH_RATE_SIGN * (gyroRateDps - gyroBiasDps);
+    /* 电机位置/速度相对车体测量，加入车体 pitch 得到轮子对地运动。 */
     position = LQR_WHEEL_RADIUS_M * LQR_DEG_TO_RAD *
-        (0.5f * (MOTOR_LEFT_SIGN * g_motor_left.measuredPositionDeg +
-                 MOTOR_RIGHT_SIGN * g_motor_right.measuredPositionDeg) + pitch);
+        (0.5f * (MOTOR_LEFT_SIGN * leftPositionDeg +
+                 MOTOR_RIGHT_SIGN * rightPositionDeg) + pitch);
     speed = LQR_WHEEL_RADIUS_M *
-        (0.1047197551f * 0.5f * (MOTOR_LEFT_SIGN * g_motor_left.measuredRpm +
-                                 MOTOR_RIGHT_SIGN * g_motor_right.measuredRpm) +
+        (LQR_RPM_TO_RAD_S * 0.5f * (MOTOR_LEFT_SIGN * leftSpeedRpm +
+                                   MOTOR_RIGHT_SIGN * rightSpeedRpm) +
          pitchRate * LQR_DEG_TO_RAD);
     g_lqr.feedbackDegraded = 0U;
     for (index = 0U; index < 4U; index++)
     {
-        Motor_TypeDef *motor = index & 1U ? &g_motor_right : &g_motor_left;
-        uint8_t valid = index < 2U ? motor->speedValid : motor->positionValid;
-        uint32_t updated = index < 2U ? motor->speedUpdatedAt : motor->positionUpdatedAt;
-        g_lqr.feedbackAgeMs[index] = now - updated;
-        if (!valid || g_lqr.feedbackAgeMs[index] >= LQR_FEEDBACK_TIMEOUT_MS)
+        g_lqr.feedbackAgeMs[index] = now - feedbackUpdatedAt[index];
+        if (!feedbackValid[index] || g_lqr.feedbackAgeMs[index] >= LQR_FEEDBACK_TIMEOUT_MS)
             feedbackProblem |= (uint8_t)(1U << index);
-        if (!valid || g_lqr.feedbackAgeMs[index] >= MOTOR_FEEDBACK_WARN_AGE_MS)
+        if (!feedbackValid[index] || g_lqr.feedbackAgeMs[index] >= MOTOR_FEEDBACK_WARN_AGE_MS)
             g_lqr.feedbackDegraded = 1U;
     }
-    taskEXIT_CRITICAL();
     feedbackReady = feedbackProblem == 0U;
     g_lqr.feedbackReady = feedbackReady;
     g_lqr.feedbackProblem = feedbackProblem;
@@ -262,6 +280,7 @@ void Car_Control(void)
         { Car_Fault(4U); return; }
         if (!Car_SensorsSafe()) { Car_Fault(3U); return; }
     }
+    /* 反馈过期先输出零电流并继续查询；新反馈恢复后继续控制，不锁存 05。 */
     if (!feedbackReady)
     {
         g_lqr.currentMa = 0;
@@ -307,7 +326,7 @@ void Car_Control(void)
         Car_Fault(9U);
         return;
     }
-    if (fabsf(g_lqr.state[0]) > 0.30f || fabsf(speed) > LQR_MAX_SPEED_M_S)
+    if (fabsf(g_lqr.state[0]) > LQR_MAX_POSITION_ERROR_M || fabsf(speed) > LQR_MAX_SPEED_M_S)
     {
         Car_Fault(12U);
         return;
@@ -327,11 +346,9 @@ void Car_Display(void)
     float pitch;
     float roll;
     float yaw;
-#if !MOTOR_CURRENT_TEST_ENABLED
     int16_t left;
     int16_t right;
     uint8_t connected;
-#endif
     uint8_t enabled;
     uint8_t fault;
     uint16_t buttons;
@@ -344,15 +361,11 @@ void Car_Display(void)
     pitch = g_mpu6050.pitch;
     roll = g_mpu6050.roll;
     yaw = g_mpu6050.yaw;
-#if !MOTOR_CURRENT_TEST_ENABLED
     left = g_car.targetL;
     right = g_car.targetR;
-#endif
     enabled = g_car.enabled;
     fault = g_car.fault;
-#if !MOTOR_CURRENT_TEST_ENABLED
     connected = g_ps2.connected && HAL_GetTick() - g_ps2.lastUpdate < PS2_TIMEOUT_MS;
-#endif
     buttons = g_ps2.buttons;
     rightX = PS2_NormalizeAxis(g_ps2.rightX, 128U);
     rightY = PS2_NormalizeAxis(g_ps2.rightY, 127U);
@@ -386,16 +399,6 @@ void Car_Display(void)
         OLED_ShowChar(&g_oled, 4U, 13U, (buttons & PS2_R1) ? '1' : '0');
         return;
     }
-#if MOTOR_CURRENT_TEST_ENABLED
-    OLED_ShowString(&g_oled, 1U, 1U, "X CURRENT TEST  ");
-    OLED_ShowString(&g_oled, 2U, 1U, "ID1:       mA   ");
-    OLED_ShowSignedNum(&g_oled, 2U, 5U, g_motor_left.commandedCurrentMa, 3U);
-    OLED_ShowString(&g_oled, 3U, 1U, "ID2:       mA   ");
-    OLED_ShowSignedNum(&g_oled, 3U, 5U, g_motor_right.commandedCurrentMa, 3U);
-    OLED_ShowString(&g_oled, 4U, 1U,
-        fault ? "FAULT STEP:0    " : enabled ? "RUN CROSS:STOP  " : "DONE RESET ONLY ");
-    if (fault) OLED_ShowNum(&g_oled, 4U, 12U, g_motor_current_test.failureStage, 1U);
-#else
     OLED_ShowString(&g_oled, 1U, 1U,
         fault ? "LQR FAULT:00    " : enabled ?
         (g_car.feedbackPriming ? "LQR WAIT FB     " : "LQR RUN         ") :
@@ -410,5 +413,4 @@ void Car_Display(void)
     OLED_ShowString(&g_oled, 4U, 1U,
         connected ? (g_lqr.feedbackReady ? (g_lqr.feedbackDegraded ? "PS2:OK  FB:WARN " : "PS2:OK  FB:OK   ") : "PS2:OK  FB:OFF  ") :
                     (g_lqr.feedbackReady ? (g_lqr.feedbackDegraded ? "PS2:OFF FB:WARN " : "PS2:OFF FB:OK   ") : "PS2:OFF FB:OFF  "));
-#endif
 }
