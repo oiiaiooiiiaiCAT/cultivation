@@ -1,6 +1,6 @@
 /**
  * @file    balance.c
- * @brief   传感器快照、LQR 状态构造、安全检查和双轮输出编排。
+ * @brief   传感器快照、LQR 状态构造及 START 手动使能的调试控制。
  */
 #include "balance.h"
 #include "i2c.h"
@@ -12,28 +12,13 @@
 
 BalanceCar_TypeDef g_car;
 static uint16_t pendingButtons;
-static uint8_t pendingDisconnect;
-/* 仅上电允许一次自动启动；急停、手动停止和发送失败后不自动重启。 */
-static uint8_t startupPending;
-
-static uint8_t Car_SensorsSafe(void)
-{
-    uint8_t safe;
-    taskENTER_CRITICAL();
-    safe = g_mpu6050.healthy && HAL_GetTick() - g_mpu6050.lastUpdate < LQR_MPU_TIMEOUT_MS &&
-           isfinite(g_mpu6050.pitch) && isfinite(g_mpu6050.roll) &&
-           fabsf(g_mpu6050.pitch) < LQR_STOP_ANGLE_DEG && fabsf(g_mpu6050.roll) < LQR_STOP_ANGLE_DEG;
-    taskEXIT_CRITICAL();
-    return safe;
-}
-
 static HAL_StatusTypeDef Car_StopMotors(void)
 {
     HAL_StatusTypeDef status;
-    startupPending = 0U;
     g_car.enabled = 0U;
     g_car.feedbackPriming = 0U;
     g_car.targetL = g_car.targetR = 0;
+    g_lqr.currentMa = 0;
     status = Motor_StopPair();
     g_car.lastStopAttempt = HAL_GetTick();
     g_car.stopPending = status != HAL_OK;
@@ -46,12 +31,6 @@ static void Car_RetryStop(void)
         Car_StopMotors();
 }
 
-static void Car_Fault(uint8_t code)
-{
-    if (!g_car.faultCode) g_car.faultCode = code;
-    Car_StopMotors();
-}
-
 void Car_Init(void)
 {
     memset(&g_car, 0, sizeof(g_car));
@@ -62,20 +41,10 @@ void Car_Init(void)
     PS2_Init();
     Filter_LPF_InitCutoff(&g_car.lpfPitchAcc, 10.0f, 200.0f);
     Filter_LPF_InitCutoff(&g_car.lpfRollAcc, 10.0f, 200.0f);
-    if (MPU6050_Init(&g_mpu6050, &hi2c2, MPU6050_ADDR) != HAL_OK)
-    {
-        if (g_car.faultCode == 0U) g_car.faultCode = 3U;
-    }
+    /* IMU 初始化结果由 initialized/healthy 表示，不建立 LQR 错误锁存。 */
+    MPU6050_Init(&g_mpu6050, &hi2c2, MPU6050_ADDR);
     g_car.canReady = MotorBus_Init(&hcan) == HAL_OK;
-    if (!g_car.canReady)
-    {
-        g_car.faultCode = 1U;
-    }
-    else if (Car_StopMotors() != HAL_OK)
-    {
-        g_car.faultCode = 2U;
-    }
-    startupPending = g_car.faultCode == 0U;
+    if (g_car.canReady) Car_StopMotors();
 }
 
 void Car_ReadMPU(void)
@@ -145,13 +114,7 @@ void Car_SetJoystick(const PS2_StateTypeDef *state)
     taskENTER_CRITICAL();
     g_ps2 = *state;
     pendingButtons |= state->pressed;
-    if (!state->connected) pendingDisconnect = 1U;
     taskEXIT_CRITICAL();
-}
-
-void Car_ClearFault(void)
-{
-    g_car.faultCode = 0U;
 }
 
 void Car_Enable(uint8_t enable)
@@ -161,36 +124,23 @@ void Car_Enable(uint8_t enable)
         Car_StopMotors();
         return;
     }
-    if (g_car.enabled || !g_lqr.outputAllowed || !g_car.canReady ||
-        !g_lqr.feedbackReady || !g_lqr.valid || !Car_SensorsSafe()) return;
-    if (fabsf(g_lqr.state[2]) >= LQR_ARM_ANGLE_DEG * LQR_DEG_TO_RAD ||
-        fabsf(g_lqr.state[1]) >= 0.05f || fabsf(g_lqr.state[3]) >= 0.25f) return;
-    startupPending = 0U;
-    if (Motor_StartBalance() != HAL_OK)
-    {
-        Car_StopMotors();
-        return;
-    }
+    /* enabled 表示软件请求状态；发送成功也不等于电机实际执行。 */
+    if (g_car.enabled || !g_car.canReady || g_car.stopPending) return;
     g_car.enabled = 1U;
-    Motor_ResetFeedback();
     g_car.feedbackPriming = 1U;
+    Motor_StartBalance();
 }
 
-/* 双轮发送不是原子操作；任一失败都进入统一停机，避免单轮持续输出。 */
-static uint8_t Car_SendBalancePair(int16_t leftCurrent, int16_t rightCurrent)
+/* 两轮分别发送，失败不触发禁用或错误锁存，下一周期继续发送。 */
+static void Car_SendBalancePair(int16_t leftCurrent, int16_t rightCurrent)
 {
-    HAL_StatusTypeDef leftStatus = Motor_SetBalanceCurrent(&g_motor_left, leftCurrent);
-    HAL_StatusTypeDef rightStatus = Motor_SetBalanceCurrent(&g_motor_right, rightCurrent);
-    if (leftStatus == HAL_OK && rightStatus == HAL_OK) return 1U;
-    /* 复用停机重试路径，不锁存通信故障；再次启动仍需按 START。 */
-    Car_StopMotors();
-    return 0U;
+    Motor_SetBalanceCurrent(&g_motor_left, leftCurrent);
+    Motor_SetBalanceCurrent(&g_motor_right, rightCurrent);
 }
 
 void Car_Control(void)
 {
     PS2_StateTypeDef state;
-    uint8_t disconnected;
     uint8_t feedbackReady = 1U;
     uint8_t index;
     uint32_t now = HAL_GetTick();
@@ -208,15 +158,14 @@ void Car_Control(void)
     state = g_ps2;
     state.pressed = pendingButtons;
     pendingButtons = 0U;
-    disconnected = pendingDisconnect;
-    pendingDisconnect = 0U;
     taskEXIT_CRITICAL();
     if (state.pressed & PS2_SELECT)
         g_oled.displayMode = (uint8_t)((g_oled.displayMode + 1U) % 3U);
-    if (((state.buttons | state.pressed) & PS2_CROSS) ||
-        (g_car.enabled && (state.pressed & PS2_START)))
+    /* 只有 START 按下边沿改变使能状态；长按、CROSS 和失联不切换。 */
+    if (state.pressed & PS2_START)
     {
-        Car_Enable(0U);
+        Car_Enable(!g_car.enabled);
+        if (g_car.canReady && !g_car.stopPending) MotorBus_PollFeedback();
         return;
     }
     if (!g_car.canReady || g_car.stopPending)
@@ -256,46 +205,19 @@ void Car_Control(void)
                                    MOTOR_RIGHT_SIGN * rightSpeedRpm) +
          pitchRate * LQR_DEG_TO_RAD);
     g_lqr.feedbackReady = feedbackReady;
-    if (g_car.enabled)
-    {
-        if (!g_lqr.outputAllowed) { Car_Enable(0U); return; }
-        if (disconnected || !state.connected || now - state.lastUpdate >= PS2_TIMEOUT_MS)
-        { Car_Fault(4U); return; }
-        if (!Car_SensorsSafe()) { Car_Fault(3U); return; }
-    }
-    /* 反馈过期先输出零电流并继续查询；新反馈恢复后继续控制，不锁存 05。 */
-    if (!feedbackReady)
-    {
-        g_lqr.currentMa = 0;
-        g_lqr.valid = 0U;
-        g_car.targetL = g_car.targetR = 0;
-        MotorBus_PollFeedback();
-        if (g_car.enabled) Car_SendBalancePair(0, 0);
-        return;
-    }
+    /* 反馈状态仅供观察，不再作为运行门槛；未更新时使用现存测量值。 */
     if (g_car.feedbackPriming)
     {
         LQR_ResetReference(position);
         g_car.feedbackPriming = 0U;
     }
     if (!g_car.enabled) LQR_ResetReference(position);
+    /* 失能时也计算 LQR，便于先在 Watch 中观察状态和增益。 */
     if (!LQR_Update(position, speed, pitch, pitchRate))
     {
-        if (g_car.enabled) Car_Fault(9U);
-        else MotorBus_PollFeedback();
-        return;
-    }
-    if (!g_car.enabled && ((state.pressed & PS2_START) ||
-        (startupPending && g_car.faultCode == 0U)) && state.connected && !disconnected &&
-        now - state.lastUpdate < PS2_TIMEOUT_MS &&
-        PS2_NormalizeAxis(state.leftX, 128U) == 0 &&
-        PS2_NormalizeAxis(state.leftY, 127U) == 0 &&
-        PS2_NormalizeAxis(state.rightX, 128U) == 0 &&
-        PS2_NormalizeAxis(state.rightY, 127U) == 0 &&
-        !(state.buttons & (PS2_UP | PS2_DOWN | PS2_LEFT | PS2_RIGHT)))
-    {
-        Car_ClearFault();
-        Car_Enable(1U);
+        g_car.targetL = g_car.targetR = 0;
+        MotorBus_PollFeedback();
+        if (g_car.enabled) Car_SendBalancePair(0, 0);
         return;
     }
     if (!g_car.enabled)
@@ -303,21 +225,15 @@ void Car_Control(void)
         MotorBus_PollFeedback();
         return;
     }
-    if (!g_lqr.feedbackDegraded &&
-        (!LQR_AdvanceReference((int16_t)-PS2_NormalizeAxis(state.leftY, 127U)) ||
-         !LQR_Update(position, speed, pitch, pitchRate)))
+    /* 失联不保留最后一个摇杆运动命令，但不停止 LQR 或禁用电机。 */
+    if (!LQR_AdvanceReference(state.connected && now - state.lastUpdate < PS2_TIMEOUT_MS ?
+        (int16_t)-PS2_NormalizeAxis(state.leftY, 127U) : 0) ||
+        !LQR_Update(position, speed, pitch, pitchRate))
     {
-        Car_Fault(9U);
-        return;
-    }
-    if (fabsf(g_lqr.state[0]) > LQR_MAX_POSITION_ERROR_M || fabsf(speed) > LQR_MAX_SPEED_M_S)
-    {
-        Car_Fault(12U);
-        return;
-    }
-    if ((state.buttons | state.pressed) & PS2_CROSS)
-    {
+        g_car.targetL = g_car.targetR = 0;
+        g_lqr.currentMa = 0;
         MotorBus_PollFeedback();
+        Car_SendBalancePair(0, 0);
         return;
     }
     g_car.targetL = (int16_t)(MOTOR_LEFT_SIGN * g_lqr.currentMa);
@@ -334,7 +250,6 @@ void Car_Display(void)
     int16_t right;
     uint8_t connected;
     uint8_t enabled;
-    uint8_t fault;
     uint16_t buttons;
     int16_t rightX;
     int16_t rightY;
@@ -347,7 +262,6 @@ void Car_Display(void)
     left = g_car.targetL;
     right = g_car.targetR;
     enabled = g_car.enabled;
-    fault = g_car.faultCode != 0U;
     connected = g_ps2.connected && HAL_GetTick() - g_ps2.lastUpdate < PS2_TIMEOUT_MS;
     buttons = g_ps2.buttons;
     rightX = PS2_NormalizeAxis(g_ps2.rightX, 128U);
@@ -383,11 +297,7 @@ void Car_Display(void)
         return;
     }
     OLED_ShowString(&g_oled, 1U, 1U,
-        fault ? "LQR FAULT:00    " : enabled ?
-        (g_car.feedbackPriming ? "LQR WAIT FB     " : "LQR RUN         ") :
-        g_lqr.feedbackReady ? (g_lqr.outputAllowed ?
-            (startupPending ? "LQR WAIT SAFE   " : "LQR STOPPED     ") : "LQR SHADOW READY") :
-                              "LQR WAIT FB     ");
+        enabled ? "LQR RUN         " : "MOTOR DISABLED  ");
     OLED_ShowString(&g_oled, 2U, 1U, "P:      R:      ");
     OLED_ShowSignedNum(&g_oled, 2U, 3U, (int32_t)pitch, 3U);
     OLED_ShowSignedNum(&g_oled, 2U, 11U, (int32_t)roll, 3U);

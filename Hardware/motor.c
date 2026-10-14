@@ -258,12 +258,7 @@ HAL_StatusTypeDef Motor_StartBalance(void)
 {
     HAL_StatusTypeDef leftStatus;
     HAL_StatusTypeDef rightStatus;
-    Motor_ResetFeedback();
-    g_motor_left.commandedCurrentMa = 0;
-    g_motor_right.commandedCurrentMa = 0;
-    leftStatus = Motor_SetHeartbeat(&g_motor_left, MOTOR_HEARTBEAT_MS);
-    rightStatus = Motor_SetHeartbeat(&g_motor_right, MOTOR_HEARTBEAT_MS);
-    if (leftStatus != HAL_OK || rightStatus != HAL_OK) return HAL_ERROR;
+    /* START 只发使能命令，不在启动路径附加心跳配置或清空反馈。 */
     leftStatus = Motor_Enable(&g_motor_left, 1U);
     rightStatus = Motor_Enable(&g_motor_right, 1U);
     return leftStatus == HAL_OK && rightStatus == HAL_OK ? HAL_OK : HAL_ERROR;

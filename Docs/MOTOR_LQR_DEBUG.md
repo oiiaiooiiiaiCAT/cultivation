@@ -2,11 +2,26 @@
 
 Motor addresses: left = 1, right = 2. No extra OLED page is added.
 
-Boot now automatically enables control once initialization, fresh feedback,
-safe stationary posture and a connected, centred controller permit it. START
-is not required for this first enable. CROSS cancels pending startup even while
-disabled. Manual stop, fault or failed transmission never automatically restarts;
-START is required to enable again. Reset/reflash can cause motor activation.
+## Manual tuning mode
+
+Boot is disabled. Each START press toggles the software enable request; holding
+START does not repeatedly toggle it. There is no automatic startup, fault latch,
+CROSS stop, controller-loss stop, tilt/speed/displacement stop or CAN-error stop.
+START does not depend on LQR posture, speed, centred axes or fresh feedback.
+
+LQR continues calculating while disabled for Watch observation. Once enabled,
+it keeps sending bounded current commands using the stored motor/IMU values;
+stale/missing feedback flags do not block output. Lost controller input freezes
+the position-reference advance but does not disable the motor. Non-finite
+calculation results produce zero current for that iteration without changing
+enable state. Current clamping and bounded CAN waits remain.
+
+This deliberately removes application-level automatic shutdown. A stale
+measurement or failed wheel transmission may leave the motor driven; START
+cannot work through a disconnected controller or broken CAN link. Secure the
+car with wheels clear of the ground and use a physical power cutoff. The
+software enable request is not actual motor-state feedback, and motor firmware
+protections are separate. Failed manual disable requests are retried.
 
 ## Watch variables in Keil
 
@@ -30,16 +45,10 @@ Each control iteration queries one item, rotating left speed, right speed,
 left position, right position. Nominal full rotation is 16 ms at a 4 ms period;
 actual timing must be checked on hardware.
 
-The obsolete asynchronous transmit bookkeeping has been removed.
 Commands use bounded mailbox/transmit waits without waiting for command
-response acknowledgements. Feedback older than 50 ms produces zero current and
-continues querying; it does not latch FAULT 05. Fresh feedback resumes control.
-IMU, excessive tilt/speed/displacement, controller disconnect and CROSS stop
-protection remain. This is not a removal of every safety condition.
-
-If either wheel's current command fails to transmit, both wheels are stopped
-using the existing stop/retry path. This does not latch a communication fault,
-but START is required to enable control again; it is not automatic recovery.
+response acknowledgements. Failed sends do not invoke stop/disable or latch
+an error; the next control iteration continues submitting commands. START
+sends motor enable commands without the former startup heartbeat configuration.
 
 ## What LQR needs
 
@@ -71,7 +80,7 @@ is not a hardware stability test.
 - `g_mpu6050`: acceleration, angular rate, gyro bias, pitch/roll/yaw and required initialization/health/timestamp fields. Raw sample copies, temperature, WHO_AM_I cache and communication configuration are removed from the public structure.
 - `g_ps2`: buttons, button edges, axes, connection and update time. `g_ps2_diag` and the cached protocol mode are removed.
 - `g_oled`: existing page selection only. The single display's I2C handle and write-failure gate are private driver state; the address is constant.
-- `g_car`: filters, output targets and active startup/stop/safety state. `faultCode == 0` replaces the redundant fault flag.
+- `g_car`: filters, current targets, software enable request and manual-stop retry state. Fault codes, latches and automatic-startup state are removed.
 - `LowPassFilter_TypeDef`: all three members participate in filtering and remain.
 
 Global structures occupy static RAM, not task-local stack. Local snapshots also

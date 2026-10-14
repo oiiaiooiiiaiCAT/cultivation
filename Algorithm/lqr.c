@@ -17,7 +17,6 @@ void LQR_Init(void)
     g_lqr.gain[2] = -1.33878598f;
     g_lqr.gain[3] = -0.11150894f;
     g_lqr.joystickSpeedScale = LQR_JOYSTICK_SPEED_SCALE;
-    g_lqr.outputAllowed = LQR_DEFAULT_OUTPUT_ALLOWED;
 }
 
 void LQR_ResetReference(float positionM)
