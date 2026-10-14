@@ -36,7 +36,7 @@ static int16_t Car_UpdateYawPid(float yawDeg, float yawRateDps)
     yawUpdatedAt = now;
     if (!isfinite(errorDeg) || !isfinite(yawRateDps) ||
         !isfinite(g_car.yawPid.kp) || !isfinite(g_car.yawPid.ki) ||
-        !isfinite(g_car.yawPid.kd) || !isfinite(g_car.yawPid.outputSign) ||
+        !isfinite(g_car.yawPid.kd) ||
         !isfinite(g_car.yawPid.integralMa))
     {
         g_car.yawPid.errorDeg = 0.0f;
@@ -102,7 +102,7 @@ void Car_Init(void)
     g_car.yawPid.kp = YAW_PID_KP_DEFAULT;
     g_car.yawPid.ki = YAW_PID_KI_DEFAULT;
     g_car.yawPid.kd = YAW_PID_KD_DEFAULT;
-    g_car.yawPid.outputSign = 1.0f;
+    g_car.yawPid.outputSign = -1.0f;
     LQR_Init();
     Motor_Init(&g_motor_left, MOTOR_LEFT_ID);
     Motor_Init(&g_motor_right, MOTOR_RIGHT_ID);

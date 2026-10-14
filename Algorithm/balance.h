@@ -28,7 +28,7 @@ typedef struct
     volatile float kp;
     volatile float ki;
     volatile float kd;
-    volatile float outputSign;    /* +1 or -1, set from the actual IMU/motor yaw direction. */
+    volatile int8_t outputSign;   /* +1 or -1, set from the actual IMU/motor yaw direction. */
 } YawPid_TypeDef;
 
 typedef struct
