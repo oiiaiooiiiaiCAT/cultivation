@@ -32,7 +32,7 @@ LQR 使用 X 固件 F5 力矩命令，初始电流限幅 ±500 mA。F5 没有硬
 ## 调试变量
 
 - MPU：`g_mpu6050`，定义在 `Hardware/mpu6050.c`。
-- PS2：`g_ps2`，定义在 `Hardware/ps2.c`。
+- PS2：`g_ps2`，定义在 `Hardware/ps2.c`。`PS2_Init()` 启动 TIM4 后额外等待 100 ms，再允许首次查询；运行期间的手柄轮询周期不变。该延时尚需实机验证，不能保证解决所有偶发无响应问题。
 - OLED：`g_oled`，定义在 `Hardware/oled.c`。
 - 电机：`g_motor_left`、`g_motor_right`，定义在 `Hardware/motor.c`；仅保留 ID、速度 rpm、累计位置 deg、有效标志、反馈时间戳和 `commandedCurrentMa`。后者是发送指令，不是实际电流；不保存原始帧或通信统计，不新增 OLED 反馈页。
 - LQR：`g_lqr`，定义在 `Algorithm/lqr.c`；`state` 单位为 m、m/s、rad、rad/s，`currentMa` 为计算电流。

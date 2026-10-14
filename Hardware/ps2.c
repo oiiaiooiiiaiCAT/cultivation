@@ -41,6 +41,8 @@ HAL_StatusTypeDef PS2_Init(void)
     previousButtons = 0U;
     previousValid = 0U;
     ready = HAL_TIM_Base_Start(&htim4) == HAL_OK;
+    /* 给无线接收机和手柄留出上电稳定时间，再开始第一帧查询。 */
+    if (ready) HAL_Delay(100U);
     return ready ? HAL_OK : HAL_ERROR;
 }
 
