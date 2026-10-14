@@ -24,7 +24,6 @@
 
 typedef struct
 {
-    uint8_t mode;
     uint16_t buttons;
     uint16_t pressed;
     uint8_t rightX;
@@ -36,20 +35,6 @@ typedef struct
 } PS2_StateTypeDef;
 
 extern PS2_StateTypeDef g_ps2;
-
-typedef struct
-{
-    uint32_t pollCount;
-    uint32_t validFrameCount;
-    uint32_t invalidFrameCount;
-    uint32_t consecutiveErrors;
-    uint32_t lastPollAt;
-    uint32_t lastValidAt;
-    uint8_t lastResponse[9];
-    HAL_StatusTypeDef lastStatus;
-} PS2_DiagnosticTypeDef;
-
-extern PS2_DiagnosticTypeDef g_ps2_diag;
 
 HAL_StatusTypeDef PS2_Init(void);
 HAL_StatusTypeDef PS2_Poll(PS2_StateTypeDef *state);

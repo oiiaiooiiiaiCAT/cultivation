@@ -6,7 +6,6 @@ static uint16_t previousButtons;
 static uint8_t ready;
 static uint8_t previousValid;
 PS2_StateTypeDef g_ps2;
-PS2_DiagnosticTypeDef g_ps2_diag;
 
 static void PS2_DelayUs(uint16_t duration)
 {
@@ -36,7 +35,6 @@ static uint8_t PS2_Transfer(uint8_t command)
 HAL_StatusTypeDef PS2_Init(void)
 {
     memset(&g_ps2, 0, sizeof(g_ps2));
-    memset(&g_ps2_diag, 0, sizeof(g_ps2_diag));
     HAL_GPIO_WritePin(PS2_CS_GPIO_Port, PS2_CS_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(PS2_CMD_GPIO_Port, PS2_CMD_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(PS2_CLK_GPIO_Port, PS2_CLK_Pin, GPIO_PIN_SET);
@@ -52,37 +50,29 @@ HAL_StatusTypeDef PS2_Poll(PS2_StateTypeDef *state)
     uint8_t response[9];
     uint8_t index;
     if (state == NULL) return HAL_ERROR;
-    g_ps2_diag.pollCount++;
-    g_ps2_diag.lastPollAt = HAL_GetTick();
     memset(state, 0, sizeof(*state));
     state->leftX = state->leftY = state->rightX = state->rightY = 128U;
     if (!ready)
     {
         previousButtons = 0U;
         previousValid = 0U;
-        g_ps2_diag.lastStatus = HAL_ERROR;
         return HAL_ERROR;
     }
     HAL_GPIO_WritePin(PS2_CS_GPIO_Port, PS2_CS_Pin, GPIO_PIN_RESET);
     PS2_DelayUs(20U);
     for (index = 0U; index < 9U; index++) response[index] = PS2_Transfer(command[index]);
     HAL_GPIO_WritePin(PS2_CS_GPIO_Port, PS2_CS_Pin, GPIO_PIN_SET);
-    memcpy(g_ps2_diag.lastResponse, response, sizeof(response));
     if (response[2] != 0x5AU || (response[1] != 0x41U && response[1] != 0x73U))
     {
         previousButtons = 0U;
         previousValid = 0U;
-        g_ps2_diag.invalidFrameCount++;
-        g_ps2_diag.consecutiveErrors++;
-        g_ps2_diag.lastStatus = HAL_ERROR;
         return HAL_ERROR;
     }
-    state->mode = response[1];
     state->buttons = (uint16_t)~((uint16_t)response[3] | ((uint16_t)response[4] << 8));
     state->pressed = previousValid ? state->buttons & (uint16_t)~previousButtons : 0U;
     previousValid = 1U;
     previousButtons = state->buttons;
-    if (state->mode == 0x73U)
+    if (response[1] == 0x73U)
     {
         state->rightX = response[5];
         state->rightY = response[6];
@@ -91,10 +81,6 @@ HAL_StatusTypeDef PS2_Poll(PS2_StateTypeDef *state)
     }
     state->connected = 1U;
     state->lastUpdate = HAL_GetTick();
-    g_ps2_diag.validFrameCount++;
-    g_ps2_diag.consecutiveErrors = 0U;
-    g_ps2_diag.lastValidAt = state->lastUpdate;
-    g_ps2_diag.lastStatus = HAL_OK;
     return HAL_OK;
 }
 

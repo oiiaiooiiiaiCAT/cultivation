@@ -28,15 +28,11 @@ extern "C" {
 #define OLED_I2C_BUF_SIZE           32U
 
 /**
-  * @brief OLED 设备结构体（每个硬件一个结构体）
+  * @brief OLED 页面状态（当前仅使用一块 OLED）
   */
 typedef struct
 {
-    I2C_HandleTypeDef *hi2c;        /* 绑定的硬件 I2C 句柄（&hi2c1） */
-    uint8_t address;                /* 7 位从机地址 0x3C */
-    HAL_StatusTypeDef lastStatus;
-    uint8_t initialized;            /* 初始化完成标志 */
-    uint8_t displayMode;
+    uint8_t displayMode;          /* 仅保留页面状态，I2C 通信由驱动内部管理。 */
 } OLED_TypeDef;
 
 extern OLED_TypeDef g_oled;

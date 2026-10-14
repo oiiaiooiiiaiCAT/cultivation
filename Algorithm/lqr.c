@@ -23,8 +23,6 @@ void LQR_Init(void)
 void LQR_ResetReference(float positionM)
 {
     g_lqr.positionReference = positionM;
-    g_lqr.referenceSpeedMps = 0.0f;
-    g_lqr.positionStepM = 0.0f;
     g_lqr.currentMa = 0;
     g_lqr.rawCurrentA = 0.0f;
 }
@@ -35,8 +33,6 @@ uint8_t LQR_AdvanceReference(int16_t forwardCommand)
     float referenceSpeed;
     float step;
     float reference;
-    g_lqr.positionStepM = 0.0f;
-    g_lqr.referenceSpeedMps = 0.0f;
     if (!isfinite(scale) || scale < 0.0f || !isfinite(g_lqr.positionReference))
     {
         g_lqr.valid = 0U;
@@ -52,8 +48,6 @@ uint8_t LQR_AdvanceReference(int16_t forwardCommand)
         g_lqr.valid = 0U;
         return 0U;
     }
-    g_lqr.positionStepM = step;
-    g_lqr.referenceSpeedMps = referenceSpeed;
     g_lqr.positionReference = reference;
     return 1U;
 }

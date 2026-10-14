@@ -6,15 +6,20 @@
   */
 #include "mpu6050.h"
 
-MPU6050_TypeDef g_mpu6050;
 #include <string.h>
+
+MPU6050_TypeDef g_mpu6050;
+/* 当前仅使用一颗 MPU6050，通信配置由驱动内部保存。 */
+static I2C_HandleTypeDef *mpuI2c;
+static uint8_t mpuAddress;
 
 /**
   * @brief  写单个寄存器（硬件 I2C）
   */
 static HAL_StatusTypeDef MPU6050_WriteReg(MPU6050_TypeDef *dev, uint8_t reg, uint8_t data)
 {
-    return HAL_I2C_Mem_Write(dev->hi2c, (uint16_t)(dev->address << 1), reg,
+    if (dev == NULL || mpuI2c == NULL) return HAL_ERROR;
+    return HAL_I2C_Mem_Write(mpuI2c, (uint16_t)(mpuAddress << 1), reg,
                              I2C_MEMADD_SIZE_8BIT, &data, 1, MPU6050_I2C_TIMEOUT_MS);
 }
 
@@ -24,7 +29,8 @@ static HAL_StatusTypeDef MPU6050_WriteReg(MPU6050_TypeDef *dev, uint8_t reg, uin
 static HAL_StatusTypeDef MPU6050_ReadRegs(MPU6050_TypeDef *dev, uint8_t reg,
                                           uint8_t *buf, uint16_t len)
 {
-    return HAL_I2C_Mem_Read(dev->hi2c, (uint16_t)(dev->address << 1), reg,
+    if (dev == NULL || mpuI2c == NULL) return HAL_ERROR;
+    return HAL_I2C_Mem_Read(mpuI2c, (uint16_t)(mpuAddress << 1), reg,
                             I2C_MEMADD_SIZE_8BIT, buf, len, MPU6050_I2C_TIMEOUT_MS);
 }
 
@@ -38,8 +44,8 @@ HAL_StatusTypeDef MPU6050_Init(MPU6050_TypeDef *dev, I2C_HandleTypeDef *hi2c, ui
 {
     if (dev == NULL || hi2c == NULL || (addr != 0x68U && addr != 0x69U)) return HAL_ERROR;
     memset(dev, 0, sizeof(*dev));
-    dev->hi2c = hi2c;
-    dev->address = addr;
+    mpuI2c = hi2c;
+    mpuAddress = addr;
     dev->initialized = 0;
 
     /* 复位 MPU6050 */
@@ -66,8 +72,7 @@ HAL_StatusTypeDef MPU6050_Init(MPU6050_TypeDef *dev, I2C_HandleTypeDef *hi2c, ui
     dev->gyroBias[1] = 0.0f;
     dev->gyroBias[2] = 0.0f;
 
-    dev->whoAmI = MPU6050_GetID(dev);
-    if (dev->whoAmI != 0x68U) return HAL_ERROR;
+    if (MPU6050_GetID(dev) != 0x68U) return HAL_ERROR;
     dev->initialized = 1;
 
     return HAL_OK;
@@ -100,23 +105,13 @@ HAL_StatusTypeDef MPU6050_ReadAll(MPU6050_TypeDef *dev)
         return HAL_ERROR;
     }
 
-    dev->accRaw[0]  = (int16_t)((buf[0]  << 8) | buf[1]);
-    dev->accRaw[1]  = (int16_t)((buf[2]  << 8) | buf[3]);
-    dev->accRaw[2]  = (int16_t)((buf[4]  << 8) | buf[5]);
-    dev->tempRaw    = (int16_t)((buf[6]  << 8) | buf[7]);
-    dev->gyroRaw[0] = (int16_t)((buf[8]  << 8) | buf[9]);
-    dev->gyroRaw[1] = (int16_t)((buf[10] << 8) | buf[11]);
-    dev->gyroRaw[2] = (int16_t)((buf[12] << 8) | buf[13]);
-
-    dev->acc_g[0] = (float)dev->accRaw[0] / MPU6050_ACC_LSB_PER_G;
-    dev->acc_g[1] = (float)dev->accRaw[1] / MPU6050_ACC_LSB_PER_G;
-    dev->acc_g[2] = (float)dev->accRaw[2] / MPU6050_ACC_LSB_PER_G;
-
-    dev->gyro_dps[0] = (float)dev->gyroRaw[0] / MPU6050_GYRO_LSB_PER_DPS;
-    dev->gyro_dps[1] = (float)dev->gyroRaw[1] / MPU6050_GYRO_LSB_PER_DPS;
-    dev->gyro_dps[2] = (float)dev->gyroRaw[2] / MPU6050_GYRO_LSB_PER_DPS;
-
-    dev->temp_c = (float)dev->tempRaw / 340.0f + 36.53f;
+    /* 直接换算需要的六轴数据；温度字节随突发读取但不保存。 */
+    dev->acc_g[0] = (float)(int16_t)((buf[0] << 8) | buf[1]) / MPU6050_ACC_LSB_PER_G;
+    dev->acc_g[1] = (float)(int16_t)((buf[2] << 8) | buf[3]) / MPU6050_ACC_LSB_PER_G;
+    dev->acc_g[2] = (float)(int16_t)((buf[4] << 8) | buf[5]) / MPU6050_ACC_LSB_PER_G;
+    dev->gyro_dps[0] = (float)(int16_t)((buf[8] << 8) | buf[9]) / MPU6050_GYRO_LSB_PER_DPS;
+    dev->gyro_dps[1] = (float)(int16_t)((buf[10] << 8) | buf[11]) / MPU6050_GYRO_LSB_PER_DPS;
+    dev->gyro_dps[2] = (float)(int16_t)((buf[12] << 8) | buf[13]) / MPU6050_GYRO_LSB_PER_DPS;
 
     return HAL_OK;
 }

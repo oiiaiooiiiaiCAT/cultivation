@@ -194,7 +194,6 @@ void MotorCtrl_Task(void const * argument)
     Car_Control();
     if (xTaskGetTickCount() - lastWake >= period)
     {
-      g_lqr.overrunCount++;
       lastWake = xTaskGetTickCount();
     }
     vTaskDelayUntil(&lastWake, period);

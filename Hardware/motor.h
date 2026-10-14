@@ -35,53 +35,20 @@
 #define MOTOR_CMD_POSITION_QUERY 0x36U
 #define MOTOR_FRAME_END         0x6BU
 
-/* 一类反馈查询的统计信息。index 0 为速度，index 1 为位置。 */
+/* 参照 F4：只公开控制需要的量，不混入原始帧、应答或收发统计。 */
 typedef struct
 {
-    volatile uint32_t requestedAt;
-    volatile uint32_t receivedAt;
-    volatile uint32_t requestCount;
-    volatile uint32_t replyCount;
-    volatile uint32_t txFailureCount;
-} Motor_FeedbackTypeDef;
-
-/* Minimal bus counters; no asynchronous TX scheduling state. */
-typedef struct
-{
-    uint8_t feedbackCursor;
-    volatile uint32_t arbitrationLossCount;
-    volatile uint32_t rxOverrunCount;
-} Motor_BusTypeDef;
-
-typedef struct
-{
-    uint8_t address;
-    int8_t forwardSign;
-    int16_t commandedRpm;
-    int16_t commandedCurrentMa;           /* Command only, NOT measured current (mA). */
-    volatile float measuredRpm;
-    volatile float measuredPositionDeg;
-    volatile float feedbackSpeedRpm;       /* 速度反馈，rpm。 */
-    volatile float feedbackPositionDeg;    /* 位置反馈，deg。 */
-    volatile uint32_t speedUpdatedAt, positionUpdatedAt; /* HAL tick, ms. */
-    volatile uint32_t feedbackSpeedAt, feedbackPositionAt;
-    volatile uint32_t feedbackFrameCount;  /* 已解析的速度/位置帧总数。 */
-    volatile uint8_t speedValid, positionValid; /* A valid frame has arrived. */
-    Motor_FeedbackTypeDef feedback[2];
-    volatile uint32_t rxCount, lastRxAt, lastRxPacket;
-    volatile uint8_t lastRxLength, lastRxData[8];
-    volatile uint8_t replyFunction, replyCode;
-    volatile uint32_t replyCount;
-    HAL_StatusTypeDef lastStatus;
-    uint32_t commandTxError, lastTxError, lastTxFailedFunction, txFailureCount;
-    uint8_t currentAccepted, commandRejected;
-    uint32_t currentAcceptedAt, currentSubmittedAt, currentReplyCount;
-    uint8_t currentReplyCode, lastRejectedFunction;
-    uint32_t malformedRxCount;
+    uint8_t address;                       /* CAN 电机 ID：左 1，右 2。 */
+    volatile uint8_t speedValid;           /* 已收到有效速度反馈。 */
+    volatile uint8_t positionValid;        /* 已收到有效位置反馈。 */
+    int16_t commandedCurrentMa;            /* 发送电流，mA；不是实测电流。 */
+    volatile float measuredRpm;            /* 有符号轴转速，rpm。 */
+    volatile float measuredPositionDeg;    /* 有符号累计轴位置，deg；供 LQR 换算位移。 */
+    volatile uint32_t speedUpdatedAt;      /* 速度反馈时间，HAL tick/ms。 */
+    volatile uint32_t positionUpdatedAt;   /* 位置反馈时间，HAL tick/ms。 */
 } Motor_TypeDef;
 
 extern Motor_TypeDef g_motor_left, g_motor_right;
-extern Motor_BusTypeDef g_motor_bus;
 
 /** @brief 调度器启动前配置 CAN 及收发通知；返回 HAL 初始化结果。 */
 HAL_StatusTypeDef MotorBus_Init(CAN_HandleTypeDef *handle);

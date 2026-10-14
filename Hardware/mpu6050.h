@@ -44,32 +44,19 @@ extern "C" {
 #define MPU6050_GYRO_LSB_PER_DPS    16.4f
 
 /**
-  * @brief MPU6050 设备结构体（每个硬件一个结构体）
+  * @brief MPU6050 姿态与融合数据，不保存通信句柄及未使用的原始/温度数据
   */
 typedef struct
 {
-    I2C_HandleTypeDef *hi2c;        /* 绑定的硬件 I2C 句柄（&hi2c2） */
-    uint8_t address;                /* 7 位从机地址 0x68 */
-
-    int16_t accRaw[3];              /* 加速度原始值 [X,Y,Z] */
-    int16_t gyroRaw[3];             /* 陀螺仪原始值 [X,Y,Z] */
-    int16_t tempRaw;                /* 温度原始值 */
-
-    float   acc_g[3];               /* 换算后的加速度，单位 g */
-    float   gyro_dps[3];            /* 换算后的角速度，单位 °/s（未去零漂） */
-    float   temp_c;                 /* 温度，单位 °C */
-
-    float   gyroBias[3];            /* 陀螺仪零偏（上电静止标定得到） */
-
-    /* 融合后的姿态角，单位度（pitch/roll 互补滤波，yaw 陀螺积分） */
-    float   pitch;
-    float   roll;
-    float   yaw;
-
-    uint8_t whoAmI;                 /* WHO_AM_I 寄存器值，正常为 0x68 */
-    uint8_t initialized;            /* 初始化完成标志 */
-    uint32_t lastUpdate;
-    uint8_t healthy;
+    float acc_g[3];              /* 三轴加速度，g；用于 pitch/roll 融合。 */
+    float gyro_dps[3];           /* 三轴角速度，deg/s；未去零偏。 */
+    float gyroBias[3];           /* 静止标定零偏，deg/s。 */
+    float pitch;                 /* 融合俯仰角，deg；包含安装补偿。 */
+    float roll;                  /* 融合横滚角，deg；用于倾倒保护和显示。 */
+    float yaw;                   /* 陀螺积分偏航角，deg；用于现有显示。 */
+    uint32_t lastUpdate;          /* 姿态更新时间，HAL tick/ms。 */
+    uint8_t initialized;          /* 初始化及静止标定有效。 */
+    uint8_t healthy;              /* 最近一次姿态更新成功。 */
 } MPU6050_TypeDef;
 
 #define MPU6050_PITCH_OFFSET_DEG 4.0f

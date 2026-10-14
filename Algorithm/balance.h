@@ -21,8 +21,7 @@ typedef struct
     int16_t targetR;              /* 右轮目标电流，mA。 */
     uint8_t canReady;
     uint8_t enabled;
-    uint8_t fault;
-    uint8_t faultCode;
+    uint8_t faultCode;           /* 0 表示无锁存故障，不再另存重复的 fault 标志。 */
     uint8_t stopPending;         /* 停机帧发送失败时，由控制任务定期重试。 */
     uint8_t feedbackPriming;     /* 使能后等待新反馈，用当前位置重置参考值。 */
     uint32_t lastStopAttempt;

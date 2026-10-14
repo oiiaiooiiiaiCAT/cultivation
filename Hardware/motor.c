@@ -10,23 +10,11 @@
 
 Motor_TypeDef g_motor_left;
 Motor_TypeDef g_motor_right;
-Motor_BusTypeDef g_motor_bus;
+static uint8_t feedbackCursor;
 static CAN_HandleTypeDef *motorCan;
 static Motor_TypeDef *registeredMotors[2];
 static volatile uint32_t completedMailboxes;
 static volatile uint32_t failedMailboxes;
-static volatile uint32_t mailboxErrors[3];
-
-static HAL_StatusTypeDef Motor_RecordTxFailure(Motor_TypeDef *motor,
-                                               uint8_t function, HAL_StatusTypeDef status)
-{
-    motor->lastStatus = status;
-    motor->lastTxError = motor->commandTxError | HAL_CAN_GetError(motorCan);
-    motor->commandTxError = motor->lastTxError;
-    motor->lastTxFailedFunction = function;
-    motor->txFailureCount++;
-    return status;
-}
 
 /* Extended ID = (address << 8) | packet; payload starts with function.
  * Control-task only: waits for CAN TX completion, not motor acknowledgement.
@@ -45,7 +33,6 @@ static HAL_StatusTypeDef Motor_Send(Motor_TypeDef *motor,
     HAL_StatusTypeDef status;
     if (motor == NULL || motorCan == NULL || motor->address == 0U || command == NULL || length < 3U)
         return HAL_ERROR;
-    motor->commandTxError = HAL_CAN_ERROR_NONE;
     while (offset < length)
     {
         uint8_t count = (uint8_t)(length - offset);
@@ -62,16 +49,15 @@ static HAL_StatusTypeDef Motor_Send(Motor_TypeDef *motor,
         {
             if (HAL_GetTick() - started >= MOTOR_TX_TIMEOUT_MS ||
                 ++waitLoops >= MOTOR_TX_WAIT_LOOPS)
-                return Motor_RecordTxFailure(motor, command[1], HAL_TIMEOUT);
+                return HAL_TIMEOUT;
         }
         completedMailboxes = 0U;
         failedMailboxes = 0U;
-        mailboxErrors[0] = mailboxErrors[1] = mailboxErrors[2] = 0U;
         HAL_CAN_ResetError(motorCan);
         status = HAL_CAN_AddTxMessage(motorCan, &header, payload, &mailbox);
         if (status != HAL_OK)
         {
-            return Motor_RecordTxFailure(motor, command[1], status);
+            return status;
         }
         started = HAL_GetTick();
         waitLoops = 0U;
@@ -79,16 +65,13 @@ static HAL_StatusTypeDef Motor_Send(Motor_TypeDef *motor,
         {
             if ((failedMailboxes & mailbox) != 0U)
             {
-                uint8_t slot = mailbox == CAN_TX_MAILBOX0 ? 0U : mailbox == CAN_TX_MAILBOX1 ? 1U : 2U;
-                motor->commandTxError = mailboxErrors[slot];
-                return Motor_RecordTxFailure(motor, command[1], HAL_ERROR);
+                return HAL_ERROR;
             }
             if (HAL_GetTick() - started >= MOTOR_TX_TIMEOUT_MS ||
                 ++waitLoops >= MOTOR_TX_WAIT_LOOPS)
             {
-                status = Motor_RecordTxFailure(motor, command[1], HAL_TIMEOUT);
                 HAL_CAN_AbortTxRequest(motorCan, mailbox);
-                return status;
+                return HAL_TIMEOUT;
             }
             if (!HAL_CAN_IsTxMessagePending(motorCan, mailbox))
             {
@@ -99,7 +82,6 @@ static HAL_StatusTypeDef Motor_Send(Motor_TypeDef *motor,
         offset = (uint8_t)(offset + count);
         packet++;
     }
-    motor->lastStatus = HAL_OK;
     return HAL_OK;
 }
 
@@ -114,7 +96,7 @@ HAL_StatusTypeDef MotorBus_Init(CAN_HandleTypeDef *handle)
         if (HAL_CAN_Init(handle) != HAL_OK) return HAL_ERROR;
     }
     motorCan = handle;
-    memset(&g_motor_bus, 0, sizeof(g_motor_bus));
+    feedbackCursor = 0U;
     filter.FilterBank = 0U;
     filter.FilterMode = CAN_FILTERMODE_IDMASK;
     filter.FilterScale = CAN_FILTERSCALE_32BIT;
@@ -163,18 +145,18 @@ void Motor_ResetFeedback(void)
     g_motor_left.speedValid = g_motor_right.speedValid = 0U;
     g_motor_left.positionValid = g_motor_right.positionValid = 0U;
     taskEXIT_CRITICAL();
-    g_motor_bus.feedbackCursor = 0U;
+    feedbackCursor = 0U;
 }
 
 /* One query per call: left speed, right speed, left position, right position. */
 HAL_StatusTypeDef MotorBus_PollFeedback(void)
 {
-    uint8_t slot = g_motor_bus.feedbackCursor;
+    uint8_t slot = feedbackCursor;
     HAL_StatusTypeDef status = Motor_RequestFeedback(
         slot & 1U ? &g_motor_right : &g_motor_left,
         slot < 2U ? MOTOR_CMD_SPEED_QUERY : MOTOR_CMD_POSITION_QUERY);
     if (status == HAL_OK)
-        g_motor_bus.feedbackCursor = (uint8_t)((slot + 1U) % 4U);
+        feedbackCursor = (uint8_t)((slot + 1U) % 4U);
     return status;
 }
 
@@ -184,7 +166,6 @@ void Motor_Init(Motor_TypeDef *motor, uint8_t address)
     if (motor == NULL || address == 0U) return;
     memset(motor, 0, sizeof(*motor));
     motor->address = address;
-    motor->forwardSign = address == MOTOR_LEFT_ID ? MOTOR_LEFT_SIGN : MOTOR_RIGHT_SIGN;
     for (index = 0U; index < 2U; index++)
     {
         if (registeredMotors[index] == NULL)
@@ -213,7 +194,6 @@ HAL_StatusTypeDef Motor_SetSpeed(Motor_TypeDef *motor, int16_t rpm)
     command[3] = (uint8_t)(magnitude >> 8);
     command[4] = (uint8_t)magnitude;
     status = Motor_Send(motor, command, sizeof(command));
-    if (status == HAL_OK) motor->commandedRpm = rpm;
     return status;
 }
 
@@ -263,7 +243,6 @@ HAL_StatusTypeDef Motor_SetBalanceCurrent(Motor_TypeDef *motor, int16_t currentM
     if (status == HAL_OK)
     {
         motor->commandedCurrentMa = currentMa;
-        motor->currentSubmittedAt = HAL_GetTick();
     }
     return status;
 }
@@ -271,18 +250,8 @@ HAL_StatusTypeDef Motor_SetBalanceCurrent(Motor_TypeDef *motor, int16_t currentM
 HAL_StatusTypeDef Motor_RequestFeedback(Motor_TypeDef *motor, uint8_t function)
 {
     uint8_t command[] = {0U, function, MOTOR_FRAME_END};
-    Motor_FeedbackTypeDef *feedback;
-    HAL_StatusTypeDef status;
     if (motor == NULL || (function != MOTOR_CMD_SPEED_QUERY && function != MOTOR_CMD_POSITION_QUERY)) return HAL_ERROR;
-    feedback = &motor->feedback[function == MOTOR_CMD_SPEED_QUERY ? 0U : 1U];
-    feedback->requestedAt = HAL_GetTick();
-    status = Motor_Send(motor, command, sizeof(command));
-    if (status == HAL_OK) feedback->requestCount++;
-    else
-    {
-        if (status != HAL_BUSY) feedback->txFailureCount++;
-    }
-    return status;
+    return Motor_Send(motor, command, sizeof(command));
 }
 
 HAL_StatusTypeDef Motor_StartBalance(void)
@@ -306,7 +275,6 @@ HAL_StatusTypeDef Motor_Stop(Motor_TypeDef *motor)
     HAL_StatusTypeDef status = Motor_Send(motor, command, sizeof(command));
     if (status == HAL_OK)
     {
-        motor->commandedRpm = 0;
         motor->commandedCurrentMa = 0;
     }
     return status;
@@ -397,104 +365,47 @@ void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *handle)
     error = HAL_CAN_GetError(handle);
     for (index = 0U; index < 3U; index++)
     {
-        if (error & arbitration[index]) g_motor_bus.arbitrationLossCount++;
         if (error & (arbitration[index] | transmit[index]))
         {
-            mailboxErrors[index] |= error & (arbitration[index] | transmit[index]);
             failedMailboxes |= 1UL << index;
         }
     }
-    if (error & HAL_CAN_ERROR_RX_FOV1) g_motor_bus.rxOverrunCount++;
     HAL_CAN_ResetError(handle);
 }
 
-static void Motor_FeedbackReceived(Motor_TypeDef *motor, uint8_t index)
-{
-    Motor_FeedbackTypeDef *feedback = &motor->feedback[index];
-    uint32_t now = HAL_GetTick();
-    feedback->replyCount++;
-    feedback->receivedAt = now;
-
-}
-
-/* ISR validates frames and updates measurements only; no control or TX waits. */
+/* ISR 只校验并更新 LQR 所需反馈，不保留原始帧和命令应答诊断。 */
 void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *handle)
 {
     CAN_RxHeaderTypeDef header;
     uint8_t payload[8];
     uint8_t index;
-    uint8_t offset;
     if (handle != motorCan) return;
     while (HAL_CAN_GetRxFifoFillLevel(handle, CAN_RX_FIFO1) != 0U)
     {
         if (HAL_CAN_GetRxMessage(handle, CAN_RX_FIFO1, &header, payload) != HAL_OK) break;
-        if (header.IDE != CAN_ID_EXT || header.RTR != CAN_RTR_DATA || header.DLC > 8U) continue;
+        if (header.IDE != CAN_ID_EXT || header.RTR != CAN_RTR_DATA ||
+            (header.ExtId & 0xFFU) != 0U) continue;
         for (index = 0U; index < 2U; index++)
         {
             Motor_TypeDef *motor = registeredMotors[index];
-            if (motor != NULL && (header.ExtId >> 8) == motor->address)
+            if (motor == NULL || (header.ExtId >> 8) != motor->address) continue;
+            if (header.DLC == 5U && payload[0] == MOTOR_CMD_SPEED_QUERY &&
+                payload[1] <= 1U && payload[4] == MOTOR_FRAME_END)
             {
-                for (offset = 0U; offset < header.DLC; offset++) motor->lastRxData[offset] = payload[offset];
-                motor->lastRxLength = (uint8_t)header.DLC;
-                motor->rxCount++;
-                motor->lastRxAt = HAL_GetTick();
-                motor->lastRxPacket = header.ExtId & 0xFFU;
-                if (header.DLC && (payload[0] == MOTOR_CMD_SPEED_QUERY || payload[0] == MOTOR_CMD_POSITION_QUERY) &&
-                    !((header.ExtId & 0xFFU) == 0U &&
-                      ((payload[0] == MOTOR_CMD_SPEED_QUERY && header.DLC == 5U && payload[1] <= 1U && payload[4] == MOTOR_FRAME_END) ||
-                       (payload[0] == MOTOR_CMD_POSITION_QUERY && header.DLC == 7U && payload[1] <= 1U && payload[6] == MOTOR_FRAME_END))))
-                    motor->malformedRxCount++;
-                if ((header.ExtId & 0xFFU) == 0U && header.DLC == 5U &&
-                    payload[0] == MOTOR_CMD_SPEED_QUERY && payload[1] <= 1U && payload[4] == MOTOR_FRAME_END)
-                {
-                    uint16_t magnitude = ((uint16_t)payload[2] << 8) | payload[3];
-                    motor->measuredRpm = (float)magnitude * (payload[1] ? -0.1f : 0.1f);
-                    motor->feedbackSpeedRpm = motor->measuredRpm;
-                    motor->speedUpdatedAt = HAL_GetTick();
-                    motor->feedbackSpeedAt = motor->speedUpdatedAt;
-                    motor->feedbackFrameCount++;
-                    motor->speedValid = 1U;
-                    Motor_FeedbackReceived(motor, 0U);
-                }
-                if ((header.ExtId & 0xFFU) == 0U && header.DLC == 7U &&
-                    payload[0] == MOTOR_CMD_POSITION_QUERY && payload[1] <= 1U && payload[6] == MOTOR_FRAME_END)
-                {
-                    uint32_t magnitude = ((uint32_t)payload[2] << 24) |
-                        ((uint32_t)payload[3] << 16) | ((uint32_t)payload[4] << 8) | payload[5];
-                    motor->measuredPositionDeg = (float)magnitude * (payload[1] ? -0.1f : 0.1f);
-                    motor->feedbackPositionDeg = motor->measuredPositionDeg;
-                    motor->positionUpdatedAt = HAL_GetTick();
-                    motor->feedbackPositionAt = motor->positionUpdatedAt;
-                    motor->feedbackFrameCount++;
-                    motor->positionValid = 1U;
-                    Motor_FeedbackReceived(motor, 1U);
-                }
-                if ((header.ExtId & 0xFFU) == 0U && header.DLC == 3U && payload[2] == MOTOR_FRAME_END)
-                {
-                    motor->replyFunction = payload[0];
-                    motor->replyCode = payload[1];
-                    motor->replyCount++;
-                    if (payload[0] == MOTOR_CMD_CURRENT || payload[0] == 0xC5U)
-                    {
-                        if (payload[1] == 0x02U)
-                        {
-                            if (!motor->commandRejected) motor->currentReplyCode = payload[1];
-                            motor->currentAcceptedAt = HAL_GetTick();
-                            motor->currentAccepted = 1U;
-                            motor->currentReplyCount++;
-                        }
-                        else if (payload[1] == 0xE2U || payload[1] == 0xEEU ||
-                                 payload[1] == 0x12U || payload[1] == 0x22U)
-                        {
-                            motor->currentReplyCode = payload[1];
-                            motor->commandRejected = 1U;
-                            motor->lastRejectedFunction = payload[0];
-                        }
-                    }
-                }
+                uint16_t magnitude = ((uint16_t)payload[2] << 8) | payload[3];
+                motor->measuredRpm = (float)magnitude * (payload[1] ? -0.1f : 0.1f);
+                motor->speedUpdatedAt = HAL_GetTick();
+                motor->speedValid = 1U;
+            }
+            else if (header.DLC == 7U && payload[0] == MOTOR_CMD_POSITION_QUERY &&
+                     payload[1] <= 1U && payload[6] == MOTOR_FRAME_END)
+            {
+                uint32_t magnitude = ((uint32_t)payload[2] << 24) |
+                    ((uint32_t)payload[3] << 16) | ((uint32_t)payload[4] << 8) | payload[5];
+                motor->measuredPositionDeg = (float)magnitude * (payload[1] ? -0.1f : 0.1f);
+                motor->positionUpdatedAt = HAL_GetTick();
+                motor->positionValid = 1U;
             }
         }
     }
 }
-
-

@@ -28,19 +28,13 @@ typedef struct
     float state[4];               /* Position error m, speed m/s, pitch rad, pitch rate rad/s. */
     float positionReference;      /* Position reference, m. */
     volatile float joystickSpeedScale;
-    float referenceSpeedMps;
-    float positionStepM;
     float rawCurrentA;
     int16_t currentMa;
     uint8_t saturated;
     uint8_t feedbackReady;
     uint8_t feedbackDegraded;
-    uint8_t feedbackProblem;      /* Bits follow feedbackAgeMs ordering. */
-    uint32_t feedbackAgeMs[4];     /* Left/right speed, left/right position, ms. */
     uint8_t valid;
     volatile uint8_t outputAllowed;
-    uint32_t lastControlTick;
-    uint32_t overrunCount;
 } LQR_TypeDef;
 
 extern LQR_TypeDef g_lqr;

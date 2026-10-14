@@ -6,8 +6,12 @@
   */
 #include "oled.h"
 
-OLED_TypeDef g_oled;
 #include "oled_font.h"
+
+OLED_TypeDef g_oled;
+/* 当前单屏使用：句柄和失败门控属于驱动内部，不放入页面状态。 */
+static I2C_HandleTypeDef *oledI2c;
+static HAL_StatusTypeDef oledStatus = HAL_ERROR;
 
 /**
   * @brief  写命令（硬件 I2C）：[0x00, Command]
@@ -15,12 +19,12 @@ OLED_TypeDef g_oled;
 static void OLED_WriteCommand(OLED_TypeDef *oled, uint8_t command)
 {
     uint8_t buf[2];
+    if (oled == NULL || oledI2c == NULL) return;
     buf[0] = 0x00;
     buf[1] = command;
-    if (oled->lastStatus != HAL_OK) return;
-    oled->lastStatus = HAL_I2C_Master_Transmit(oled->hi2c, (uint16_t)(oled->address << 1),
+    if (oledStatus != HAL_OK) return;
+    oledStatus = HAL_I2C_Master_Transmit(oledI2c, (uint16_t)(OLED_ADDR << 1),
                                                buf, 2, OLED_I2C_TIMEOUT_MS);
-    if (oled->lastStatus != HAL_OK) oled->initialized = 0U;
 }
 
 /**
@@ -32,6 +36,7 @@ static void OLED_WriteDataBuf(OLED_TypeDef *oled, const uint8_t *data, uint16_t 
     uint8_t buf[OLED_I2C_BUF_SIZE];
     uint16_t i;
     uint16_t sent = 0;
+    if (oled == NULL || oledI2c == NULL) return;
 
     buf[0] = 0x40;
     while (sent < len)
@@ -42,12 +47,11 @@ static void OLED_WriteDataBuf(OLED_TypeDef *oled, const uint8_t *data, uint16_t 
             buf[1U + i] = data[sent++];
             n++;
         }
-        if (oled->lastStatus != HAL_OK) return;
-        oled->lastStatus = HAL_I2C_Master_Transmit(oled->hi2c, (uint16_t)(oled->address << 1),
+        if (oledStatus != HAL_OK) return;
+        oledStatus = HAL_I2C_Master_Transmit(oledI2c, (uint16_t)(OLED_ADDR << 1),
                                                    buf, (uint16_t)(n + 1U), OLED_I2C_TIMEOUT_MS);
-        if (oled->lastStatus != HAL_OK)
+        if (oledStatus != HAL_OK)
         {
-            oled->initialized = 0U;
             return;
         }
     }
@@ -266,11 +270,10 @@ void OLED_ShowFloat(OLED_TypeDef *oled, uint8_t line, uint8_t column,
   */
 void OLED_Init(OLED_TypeDef *oled, I2C_HandleTypeDef *hi2c)
 {
-    oled->hi2c = hi2c;
-    oled->address = OLED_ADDR;
-    oled->initialized = 0;
+    if (oled == NULL || hi2c == NULL) return;
+    oledI2c = hi2c;
     oled->displayMode = 0U;
-    oled->lastStatus = HAL_OK;
+    oledStatus = HAL_OK;
 
     HAL_Delay(200);   /* 上电等待电源稳定 */
 
@@ -313,5 +316,4 @@ void OLED_Init(OLED_TypeDef *oled, I2C_HandleTypeDef *hi2c)
     OLED_WriteCommand(oled, 0xAF);   /* 开启显示 */
 
     OLED_Clear(oled);
-    oled->initialized = oled->lastStatus == HAL_OK;
 }

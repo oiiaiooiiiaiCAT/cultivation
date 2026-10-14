@@ -21,7 +21,7 @@ STM32F103C8T6，全部外设驱动使用 HAL，FreeRTOS CMSIS-RTOS v1 调度。
 
 LQR 使用 X 固件 F5 力矩命令，初始电流限幅 ±500 mA。F5 没有硬件限速；模型中的惯量、轮子质量和力矩系数仍是估值，方向和动态响应尚需实测，不能认为已完成实车平衡。CAN 偶发发送错误的根因尚未确认。
 
-已使能时左摇杆 Y 控制前后位置目标，死区 ±5、输入限幅 ±120，上推前进、下推后退、回中保持目标。`referenceSpeedMps = -归一化LeftY * joystickSpeedScale`，再每次按 `referenceSpeedMps * 0.004` 累加位置。`g_lqr.joystickSpeedScale` 可监测调节，默认 `0.0005`，满杆目标增长速度 0.06 m/s，每 4 ms 增减 0.00024 m；默认宏 `LQR_JOYSTICK_SPEED_SCALE` 在 `Algorithm/lqr.h`。原有实际速度及 0.30 m 位置偏差保护保持不变。
+已使能时左摇杆 Y 控制前后位置目标，死区 ±5、输入限幅 ±120，上推前进、下推后退、回中保持目标。目标速度为 `-归一化LeftY * joystickSpeedScale`，每次按目标速度乘 `0.004` 累加位置，计算中间量不再保存在结构体中。`g_lqr.joystickSpeedScale` 可监测调节，默认 `0.0005`，满杆目标增长速度 0.06 m/s，每 4 ms 增减 0.00024 m；默认宏 `LQR_JOYSTICK_SPEED_SCALE` 在 `Algorithm/lqr.h`。原有实际速度及 0.30 m 位置偏差保护保持不变。
 
 反馈观察及 LQR 建模步骤见 `Docs/MOTOR_LQR_DEBUG.md`；根据参考 F4 提炼的编码规范见 `Docs/F4_CODING_STANDARD.md`。旧独立电流测试分支已移除，不再通过测试宏启动电机。
 
@@ -30,7 +30,7 @@ LQR 使用 X 固件 F5 力矩命令，初始电流限幅 ±500 mA。F5 没有硬
 - MPU：`g_mpu6050`，定义在 `Hardware/mpu6050.c`。
 - PS2：`g_ps2`，定义在 `Hardware/ps2.c`。
 - OLED：`g_oled`，定义在 `Hardware/oled.c`。
-- 电机：`g_motor_left`、`g_motor_right`，定义在 `Hardware/motor.c`；可观察速度 rpm、位置 deg、有效标志、反馈时间戳、收发计数和原始帧。`commandedCurrentMa` 是发送指令，不是实际电流。`g_motor_bus` 保存轮询位置及总线诊断计数，不新增 OLED 反馈页。
+- 电机：`g_motor_left`、`g_motor_right`，定义在 `Hardware/motor.c`；仅保留 ID、速度 rpm、累计位置 deg、有效标志、反馈时间戳和 `commandedCurrentMa`。后者是发送指令，不是实际电流；不保存原始帧或通信统计，不新增 OLED 反馈页。
 - LQR：`g_lqr`，定义在 `Algorithm/lqr.c`；`state` 单位为 m、m/s、rad、rad/s，`currentMa` 为计算电流。
 - 系统：`g_car`，定义在 `Algorithm/balance.c`；`faultCode` 为 LQR 故障码，`targetL/targetR` 为 mA。
 
@@ -40,4 +40,4 @@ LQR 使用 X 固件 F5 力矩命令，初始电流限幅 ±500 mA。F5 没有硬
 
 LQR 增益须根据实测机械参数、电流输入模型和实际采样周期离线计算；本仓库固件不求解 Riccati 方程，现有 K 未完成实车验证。数值验证和编译不能替代硬件验证。
 
-当前任务栈字数为 default=64、MPU=128、motor=168、OLED=128、hand=128，FreeRTOS 堆 3072 字节，本次未改这些配置。`.ioc` 中 CAN AutoBusOff 配置仍与生成源码不一致；以当前 `can.c` 为准，自动重发开启、自动 bus-off 恢复关闭。发送等待受 `MOTOR_TX_TIMEOUT_MS=1` 和 `MOTOR_TX_WAIT_LOOPS` 限制；这不表示整个控制函数必定在 1 ms 内完成，需实测并观察 `g_lqr.overrunCount`。重新生成前应人工核对并保留自定义驱动、LQR 文件及 `INCLUDE_vTaskDelayUntil=1`。
+当前任务栈字数为 default=64、MPU=128、motor=168、OLED=128、hand=128，FreeRTOS 堆 3072 字节，本次未改这些配置。`.ioc` 中 CAN AutoBusOff 配置仍与生成源码不一致；以当前 `can.c` 为准，自动重发开启、自动 bus-off 恢复关闭。发送等待受 `MOTOR_TX_TIMEOUT_MS=1` 和 `MOTOR_TX_WAIT_LOOPS` 限制；这不表示整个控制函数必定在 1 ms 内完成，整个控制周期及任务栈余量仍需实测，固件不再保存超周期统计。重新生成前应人工核对并保留自定义驱动、LQR 文件及 `INCLUDE_vTaskDelayUntil=1`。
