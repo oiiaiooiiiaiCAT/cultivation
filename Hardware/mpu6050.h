@@ -37,11 +37,22 @@ extern "C" {
 #define MPU6050_REG_PWR_MGMT_2      0x6CU
 #define MPU6050_REG_WHO_AM_I        0x75U
 
-/* 量程配置（本驱动固定使用：加速度 ±8g，陀螺仪 ±2000dps） */
-#define MPU6050_ACC_SCALE_G         8.0f    /* ±8g  -> 4096 LSB/g   */
+/* 量程配置（本驱动固定使用：加速度 ±4g，陀螺仪 ±2000dps） */
+#define MPU6050_ACC_SCALE_G         4.0f    /* ±4g  -> 8192 LSB/g   */
 #define MPU6050_GYRO_SCALE_DPS      2000.0f /* ±2000 dps -> 16.4 LSB/(dps) */
-#define MPU6050_ACC_LSB_PER_G       4096.0f
+#define MPU6050_ACC_LSB_PER_G       8192.0f
 #define MPU6050_GYRO_LSB_PER_DPS    16.4f
+
+#define MPU6050_CAL_SETTLE_MS 1000U
+#define MPU6050_CAL_SAMPLES 500U
+#define MPU6050_CAL_PERIOD_MS 5U
+#define MPU6050_CAL_ATTEMPTS 3U
+#define MPU6050_CAL_GYRO_STD_DPS 0.35f
+#define MPU6050_CAL_GYRO_RANGE_DPS 2.0f
+#define MPU6050_CAL_GYRO_MAX_DPS 20.0f
+#define MPU6050_CAL_ACC_STD_G 0.02f
+#define MPU6050_CAL_ACC_MIN_G 0.85f
+#define MPU6050_CAL_ACC_MAX_G 1.15f
 
 /**
   * @brief MPU6050 姿态与融合数据，不保存通信句柄及未使用的原始/温度数据
@@ -55,11 +66,12 @@ typedef struct
     float roll;                  /* 融合横滚角，deg；用于倾倒保护和显示。 */
     float yaw;                   /* 陀螺积分偏航角，deg；用于现有显示。 */
     uint32_t lastUpdate;          /* 姿态更新时间，HAL tick/ms。 */
-    uint8_t initialized;          /* 初始化及静止标定有效。 */
+    uint8_t initialized;          /* 寄存器配置及设备身份检查成功。 */
+    uint8_t gyroCalibrated;
     uint8_t healthy;              /* 最近一次姿态更新成功。 */
 } MPU6050_TypeDef;
 
-#define MPU6050_PITCH_OFFSET_DEG 4.0f
+#define MPU6050_PITCH_OFFSET_DEG 2.4f
 
 extern MPU6050_TypeDef g_mpu6050;
 
@@ -72,8 +84,8 @@ uint8_t MPU6050_GetID(MPU6050_TypeDef *dev);
 /* 硬件 I2C 突发读取加速度、温度、陀螺仪共 14 字节，并完成工程量换算 */
 HAL_StatusTypeDef MPU6050_ReadAll(MPU6050_TypeDef *dev);
 
-/* 静止状态下标定陀螺仪零偏（标定期间车体必须保持静止、水平） */
-void MPU6050_CalibrateGyro(MPU6050_TypeDef *dev, uint16_t samples);
+/* 调度器启动前静止标定；无需水平。HAL_BUSY为静止检查失败，HAL_ERROR为读取或参数错误。 */
+HAL_StatusTypeDef MPU6050_CalibrateGyro(MPU6050_TypeDef *dev, uint16_t samples);
 
 #ifdef __cplusplus
 }

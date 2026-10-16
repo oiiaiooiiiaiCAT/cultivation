@@ -5,8 +5,6 @@
 #include <string.h>
 
 #include "motor.h"
-#include "FreeRTOS.h"
-#include "task.h"
 
 Motor_TypeDef g_motor_left;
 Motor_TypeDef g_motor_right;
@@ -116,6 +114,7 @@ HAL_StatusTypeDef MotorBus_CancelPending(void)
     uint32_t mask = 0U;
     uint32_t started;
     uint32_t waitLoops = 0U;
+    uint32_t interruptMask;
     uint8_t index;
     if (motorCan == NULL) return HAL_ERROR;
     /* Check hardware mailboxes; normal TX no longer marks legacy active flags. */
@@ -132,19 +131,21 @@ HAL_StatusTypeDef MotorBus_CancelPending(void)
                 return HAL_TIMEOUT;
         }
     }
-    taskENTER_CRITICAL();
+    interruptMask = __get_PRIMASK();
+    __disable_irq();
     completedMailboxes &= ~mask;
     failedMailboxes &= ~mask;
-    taskEXIT_CRITICAL();
+    __set_PRIMASK(interruptMask);
     return HAL_OK;
 }
 
 void Motor_ResetFeedback(void)
 {
-    taskENTER_CRITICAL();
+    uint32_t interruptMask = __get_PRIMASK();
+    __disable_irq();
     g_motor_left.speedValid = g_motor_right.speedValid = 0U;
     g_motor_left.positionValid = g_motor_right.positionValid = 0U;
-    taskEXIT_CRITICAL();
+    __set_PRIMASK(interruptMask);
     feedbackCursor = 0U;
 }
 

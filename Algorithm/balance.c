@@ -18,6 +18,7 @@ static uint32_t yawUpdatedAt;
 static void Car_ResetYawPid(float referenceDeg)
 {
     g_car.yawPid.referenceDeg = referenceDeg;
+    g_lqr.joystickPitchOffsetDeg = 0.0f;
     g_car.yawPid.errorDeg = 0.0f;
     g_car.yawPid.integralMa = 0.0f;
     g_car.yawPid.correctionMa = 0.0f;
@@ -98,6 +99,8 @@ static void Car_RetryStop(void)
 
 void Car_Init(void)
 {
+    uint8_t attempt;
+    HAL_StatusTypeDef calibrationStatus = HAL_ERROR;
     memset(&g_car, 0, sizeof(g_car));
     g_car.yawPid.kp = YAW_PID_KP_DEFAULT;
     g_car.yawPid.ki = YAW_PID_KI_DEFAULT;
@@ -110,10 +113,31 @@ void Car_Init(void)
     PS2_Init();
     Filter_LPF_InitCutoff(&g_car.lpfPitchAcc, 10.0f, 200.0f);
     Filter_LPF_InitCutoff(&g_car.lpfRollAcc, 10.0f, 200.0f);
-    /* IMU 初始化结果由 initialized/healthy 表示，不建立 LQR 错误锁存。 */
-    MPU6050_Init(&g_mpu6050, &hi2c2, MPU6050_ADDR);
     g_car.canReady = MotorBus_Init(&hcan) == HAL_OK;
     if (g_car.canReady) Car_StopMotors();
+    OLED_ShowString(&g_oled, 1U, 1U, "IMU CALIBRATION ");
+    OLED_ShowString(&g_oled, 2U, 1U, "KEEP CAR STILL  ");
+    OLED_ShowString(&g_oled, 3U, 1U, "IMU INIT...     ");
+    if (MPU6050_Init(&g_mpu6050, &hi2c2, MPU6050_ADDR) != HAL_OK)
+    {
+        OLED_ShowString(&g_oled, 3U, 1U, "IMU INIT FAILED ");
+        OLED_ShowString(&g_oled, 4U, 1U, "CHECK AND RESET ");
+        return;
+    }
+    OLED_ShowString(&g_oled, 3U, 1U, "STABILIZING...  ");
+    HAL_Delay(MPU6050_CAL_SETTLE_MS);
+    for (attempt = 0U; attempt < MPU6050_CAL_ATTEMPTS; attempt++)
+    {
+        OLED_ShowString(&g_oled, 3U, 1U, "CALIBRATING...  ");
+        OLED_ShowString(&g_oled, 4U, 1U, "TRY:            ");
+        OLED_ShowNum(&g_oled, 4U, 6U, attempt + 1U, 1U);
+        calibrationStatus = MPU6050_CalibrateGyro(&g_mpu6050, MPU6050_CAL_SAMPLES);
+        if (calibrationStatus == HAL_OK) break;
+    }
+    OLED_ShowString(&g_oled, 3U, 1U,
+        calibrationStatus == HAL_OK ? "CALIBRATION OK  " : "IMU CAL FAILED  ");
+    OLED_ShowString(&g_oled, 4U, 1U,
+        calibrationStatus == HAL_OK ? "PRESS START     " : "HOLD STILL RESET");
 }
 
 void Car_ReadMPU(void)
@@ -194,7 +218,8 @@ void Car_Enable(uint8_t enable)
         return;
     }
     /* enabled 表示软件请求状态；发送成功也不等于电机实际执行。 */
-    if (g_car.enabled || !g_car.canReady || g_car.stopPending) return;
+    if (g_car.enabled || !g_car.canReady || g_car.stopPending ||
+        !g_mpu6050.gyroCalibrated) return;
     g_car.enabled = 1U;
     g_car.feedbackPriming = 1U;
     Car_ResetYawPid(g_mpu6050.yaw);
@@ -226,6 +251,8 @@ void Car_Control(void)
     float rightPositionDeg;
     float leftSpeedRpm;
     float rightSpeedRpm;
+    int16_t leftX;
+    int16_t leftY;
     taskENTER_CRITICAL();
     state = g_ps2;
     state.pressed = pendingButtons;
@@ -258,6 +285,8 @@ void Car_Control(void)
     rightPositionDeg = g_motor_right.measuredPositionDeg;
     leftSpeedRpm = g_motor_left.measuredRpm;
     rightSpeedRpm = g_motor_right.measuredRpm;
+    leftX = PS2_NormalizeAxis(state.leftX, 128U);
+    leftY = PS2_NormalizeAxis(state.leftY, 127U);
     g_lqr.feedbackDegraded = 0U;
     for (index = 0U; index < 4U; index++)
     {
@@ -300,9 +329,18 @@ void Car_Control(void)
         return;
     }
     /* 失联不保留最后一个摇杆运动命令，但不停止 LQR 或禁用电机。 */
-    if (!LQR_AdvanceReference(state.connected && now - state.lastUpdate < PS2_TIMEOUT_MS ?
-        (int16_t)-PS2_NormalizeAxis(state.leftY, 127U) : 0) ||
-        !LQR_Update(position, speed, pitch, pitchRate))
+    if (!state.connected || now - state.lastUpdate >= PS2_TIMEOUT_MS)
+    {
+        leftX = 0;
+        leftY = 0;
+    }
+    g_car.yawPid.referenceDeg -= (float)leftX * JOYSTICK_YAW_RATE_DPS / 120.0f *
+        (float)LQR_PERIOD_MS * 0.001f;
+    if (g_car.yawPid.referenceDeg > 180.0f) g_car.yawPid.referenceDeg -= 360.0f;
+    if (g_car.yawPid.referenceDeg < -180.0f) g_car.yawPid.referenceDeg += 360.0f;
+    g_lqr.joystickPitchOffsetDeg =
+        -(float)leftY * LQR_JOYSTICK_PITCH_MAX_DEG / 120.0f;
+    if (!LQR_Update(position, speed, pitch, pitchRate))
     {
         g_car.targetL = g_car.targetR = 0;
         g_lqr.currentMa = 0;
@@ -319,15 +357,29 @@ void Car_Control(void)
     MotorBus_PollFeedback();
     Car_SendBalancePair(g_car.targetL, g_car.targetR);
 }
+static void Car_ShowAngle(uint8_t line, uint8_t column, float angleDeg)
+{
+    if (!isfinite(angleDeg) || fabsf(angleDeg) > 999.9f)
+    {
+        OLED_ShowString(&g_oled, line, column, " ERROR");
+        return;
+    }
+    OLED_ShowChar(&g_oled, line, column, angleDeg < 0.0f ? '-' : '+');
+    OLED_ShowFloat(&g_oled, line, (uint8_t)(column + 1U), fabsf(angleDeg), 3U, 1U);
+}
+
 void Car_Display(void)
 {
     float pitch;
+    float balancePitch;
     float roll;
     float yaw;
     int16_t left;
     int16_t right;
     uint8_t connected;
     uint8_t enabled;
+    uint8_t imuInitialized;
+    uint8_t gyroCalibrated;
     uint16_t buttons;
     int16_t rightX;
     int16_t rightY;
@@ -335,11 +387,14 @@ void Car_Display(void)
     int16_t leftY;
     taskENTER_CRITICAL();
     pitch = g_mpu6050.pitch;
+    balancePitch = g_lqr.balancePitchDeg + g_lqr.joystickPitchOffsetDeg;
     roll = g_mpu6050.roll;
     yaw = g_mpu6050.yaw;
     left = g_car.targetL;
     right = g_car.targetR;
     enabled = g_car.enabled;
+    imuInitialized = g_mpu6050.initialized;
+    gyroCalibrated = g_mpu6050.gyroCalibrated;
     connected = g_ps2.connected && HAL_GetTick() - g_ps2.lastUpdate < PS2_TIMEOUT_MS;
     buttons = g_ps2.buttons;
     rightX = PS2_NormalizeAxis(g_ps2.rightX, 128U);
@@ -349,13 +404,14 @@ void Car_Display(void)
     taskEXIT_CRITICAL();
     if (g_oled.displayMode == 1U)
     {
-        OLED_ShowString(&g_oled, 1U, 1U, "MPU ANGLE MODE   ");
+        OLED_ShowString(&g_oled, 1U, 1U, "REF:       deg  ");
+        Car_ShowAngle(1U, 5U, balancePitch);
         OLED_ShowString(&g_oled, 2U, 1U, "PITCH:          ");
-        OLED_ShowSignedNum(&g_oled, 2U, 8U, (int32_t)pitch, 3U);
+        Car_ShowAngle(2U, 8U, pitch);
         OLED_ShowString(&g_oled, 3U, 1U, "YAW:            ");
-        OLED_ShowSignedNum(&g_oled, 3U, 6U, (int32_t)yaw, 3U);
+        Car_ShowAngle(3U, 6U, yaw);
         OLED_ShowString(&g_oled, 4U, 1U, "ROLL:           ");
-        OLED_ShowSignedNum(&g_oled, 4U, 7U, (int32_t)roll, 3U);
+        Car_ShowAngle(4U, 7U, roll);
         return;
     }
     if (g_oled.displayMode == 2U)
@@ -375,13 +431,15 @@ void Car_Display(void)
         return;
     }
     OLED_ShowString(&g_oled, 1U, 1U,
+        !imuInitialized ? "IMU INIT FAILED " :
+        !gyroCalibrated ? "IMU CAL FAILED  " :
         enabled ? "LQR RUN         " : "MOTOR DISABLED  ");
-    OLED_ShowString(&g_oled, 2U, 1U, "P:      R:      ");
-    OLED_ShowSignedNum(&g_oled, 2U, 3U, (int32_t)pitch, 3U);
-    OLED_ShowSignedNum(&g_oled, 2U, 11U, (int32_t)roll, 3U);
+    OLED_ShowString(&g_oled, 2U, 1U, "P:      E:      ");
+    Car_ShowAngle(2U, 3U, pitch);
+    Car_ShowAngle(2U, 11U, pitch - balancePitch);
     OLED_ShowString(&g_oled, 3U, 1U, "I1:     I2:     ");
-    OLED_ShowSignedNum(&g_oled, 3U, 4U, left, 3U);
-    OLED_ShowSignedNum(&g_oled, 3U, 12U, right, 3U);
+    OLED_ShowSignedNum(&g_oled, 3U, 4U, left, 4U);
+    OLED_ShowSignedNum(&g_oled, 3U, 12U, right, 4U);
     OLED_ShowString(&g_oled, 4U, 1U,
         connected ? (g_lqr.feedbackReady ? (g_lqr.feedbackDegraded ? "PS2:OK  FB:WARN " : "PS2:OK  FB:OK   ") : "PS2:OK  FB:OFF  ") :
                     (g_lqr.feedbackReady ? (g_lqr.feedbackDegraded ? "PS2:OFF FB:WARN " : "PS2:OFF FB:OK   ") : "PS2:OFF FB:OFF  "));

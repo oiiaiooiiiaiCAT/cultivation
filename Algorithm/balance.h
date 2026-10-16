@@ -13,11 +13,16 @@
 #include "filter.h"
 #include "lqr.h"
 
+#if LQR_CURRENT_LIMIT_MA > MOTOR_CURRENT_LIMIT_MA
+#error LQR_CURRENT_LIMIT_MA_exceeds_motor_current_limit
+#endif
+
 #define YAW_PID_MAX_CORRECTION_MA 250
 #define YAW_PID_KP_DEFAULT 8.0f
 #define YAW_PID_KI_DEFAULT 0.5f
 #define YAW_PID_KD_DEFAULT 0.15f
 #define YAW_PID_INTEGRAL_LIMIT_MA 120.0f
+#define JOYSTICK_YAW_RATE_DPS 75.0f
 
 typedef struct
 {

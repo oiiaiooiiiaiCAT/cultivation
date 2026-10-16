@@ -6,6 +6,7 @@
   */
 #include "mpu6050.h"
 
+#include <math.h>
 #include <string.h>
 
 MPU6050_TypeDef g_mpu6050;
@@ -65,8 +66,8 @@ HAL_StatusTypeDef MPU6050_Init(MPU6050_TypeDef *dev, I2C_HandleTypeDef *hi2c, ui
     if (MPU6050_WriteReg(dev, MPU6050_REG_CONFIG, 0x03) != HAL_OK) return HAL_ERROR;
     /* GYRO_CONFIG = 0x18：陀螺仪 ±2000dps */
     if (MPU6050_WriteReg(dev, MPU6050_REG_GYRO_CONFIG, 0x18) != HAL_OK) return HAL_ERROR;
-    /* ACCEL_CONFIG = 0x10：加速度 ±8g */
-    if (MPU6050_WriteReg(dev, MPU6050_REG_ACCEL_CONFIG, 0x10) != HAL_OK) return HAL_ERROR;
+    /* ACCEL_CONFIG = 0x08：加速度 ±4g */
+    if (MPU6050_WriteReg(dev, MPU6050_REG_ACCEL_CONFIG, 0x08) != HAL_OK) return HAL_ERROR;
 
     dev->gyroBias[0] = 0.0f;
     dev->gyroBias[1] = 0.0f;
@@ -117,37 +118,69 @@ HAL_StatusTypeDef MPU6050_ReadAll(MPU6050_TypeDef *dev)
 }
 
 /**
-  * @brief  陀螺仪零偏标定（静止、水平状态下调用）
-  * @param  samples : 采样次数，建议 1000~2000
+  * @brief  静止采样，检查波动及重力幅值，仅成功时提交三轴零偏
+  * @param  samples : 采样次数，至少2次，启动默认500次
   */
-void MPU6050_CalibrateGyro(MPU6050_TypeDef *dev, uint16_t samples)
+HAL_StatusTypeDef MPU6050_CalibrateGyro(MPU6050_TypeDef *dev, uint16_t samples)
 {
-    float sum[3] = {0.0f, 0.0f, 0.0f};
-    uint16_t valid = 0;
-    uint16_t i;
+    float gyroMean[3] = {0.0f, 0.0f, 0.0f};
+    float gyroVarianceSum[3] = {0.0f, 0.0f, 0.0f};
+    float accMean[3] = {0.0f, 0.0f, 0.0f};
+    float accVarianceSum[3] = {0.0f, 0.0f, 0.0f};
+    float gyroMinimum[3];
+    float gyroMaximum[3];
+    uint16_t sampleIndex;
+    uint8_t axis;
+    uint8_t stationary = 1U;
 
-    if (dev == NULL || !dev->initialized || samples == 0U) return;
-    for (i = 0; i < samples; i++)
+    if (dev == NULL) return HAL_ERROR;
+    dev->gyroCalibrated = 0U;
+    if (!dev->initialized || samples < 2U) return HAL_ERROR;
+    for (sampleIndex = 0U; sampleIndex < samples; sampleIndex++)
     {
-        if (MPU6050_ReadAll(dev) == HAL_OK)
+        float accelerationSquared = 0.0f;
+        HAL_Delay(MPU6050_CAL_PERIOD_MS);
+        if (MPU6050_ReadAll(dev) != HAL_OK) return HAL_ERROR;
+        for (axis = 0U; axis < 3U; axis++)
         {
-            sum[0] += dev->gyro_dps[0];
-            sum[1] += dev->gyro_dps[1];
-            sum[2] += dev->gyro_dps[2];
-            valid++;
+            float gyro = dev->gyro_dps[axis];
+            float acceleration = dev->acc_g[axis];
+            float gyroDelta;
+            float accDelta;
+            if (!isfinite(gyro) || !isfinite(acceleration)) return HAL_ERROR;
+            if (fabsf(gyro) > MPU6050_CAL_GYRO_MAX_DPS) stationary = 0U;
+            accelerationSquared += acceleration * acceleration;
+            if (sampleIndex == 0U)
+            {
+                gyroMinimum[axis] = gyro;
+                gyroMaximum[axis] = gyro;
+            }
+            if (gyro < gyroMinimum[axis]) gyroMinimum[axis] = gyro;
+            if (gyro > gyroMaximum[axis]) gyroMaximum[axis] = gyro;
+            gyroDelta = gyro - gyroMean[axis];
+            gyroMean[axis] += gyroDelta / (float)(sampleIndex + 1U);
+            gyroVarianceSum[axis] += gyroDelta * (gyro - gyroMean[axis]);
+            accDelta = acceleration - accMean[axis];
+            accMean[axis] += accDelta / (float)(sampleIndex + 1U);
+            accVarianceSum[axis] += accDelta * (acceleration - accMean[axis]);
         }
-        HAL_Delay(5);
+        if (accelerationSquared < MPU6050_CAL_ACC_MIN_G * MPU6050_CAL_ACC_MIN_G ||
+            accelerationSquared > MPU6050_CAL_ACC_MAX_G * MPU6050_CAL_ACC_MAX_G)
+            stationary = 0U;
     }
-
-    if (valid < (uint32_t)samples * 4U / 5U || valid == 0U)
+    for (axis = 0U; axis < 3U; axis++)
     {
-        dev->initialized = 0U;
-        return;
+        float gyroVariance = gyroVarianceSum[axis] / (float)(samples - 1U);
+        float accVariance = accVarianceSum[axis] / (float)(samples - 1U);
+        if (!isfinite(gyroMean[axis]) || !isfinite(gyroVariance) ||
+            !isfinite(accVariance)) return HAL_ERROR;
+        if (gyroVariance > MPU6050_CAL_GYRO_STD_DPS * MPU6050_CAL_GYRO_STD_DPS ||
+            accVariance > MPU6050_CAL_ACC_STD_G * MPU6050_CAL_ACC_STD_G ||
+            gyroMaximum[axis] - gyroMinimum[axis] > MPU6050_CAL_GYRO_RANGE_DPS)
+            stationary = 0U;
     }
-    if (valid > 0)
-    {
-        dev->gyroBias[0] = sum[0] / valid;
-        dev->gyroBias[1] = sum[1] / valid;
-        dev->gyroBias[2] = sum[2] / valid;
-    }
+    if (!stationary) return HAL_BUSY;
+    memcpy(dev->gyroBias, gyroMean, sizeof(gyroMean));
+    dev->gyroCalibrated = 1U;
+    return HAL_OK;
 }

@@ -163,22 +163,27 @@
         <Ww>
           <count>0</count>
           <WinNumber>1</WinNumber>
-          <ItemText>uwTick,0x0A</ItemText>
+          <ItemText>g_motor_left,0x0A</ItemText>
         </Ww>
         <Ww>
           <count>1</count>
           <WinNumber>1</WinNumber>
-          <ItemText>PRIMASK,0x0A</ItemText>
+          <ItemText>g_motor_right,0x0A</ItemText>
         </Ww>
         <Ww>
           <count>2</count>
           <WinNumber>1</WinNumber>
-          <ItemText>TIM1-&gt;SR,0x0A</ItemText>
+          <ItemText>g_mpu6050</ItemText>
         </Ww>
         <Ww>
           <count>3</count>
           <WinNumber>1</WinNumber>
-          <ItemText>TIM1-&gt;DIER,0x0A</ItemText>
+          <ItemText>g_oled</ItemText>
+        </Ww>
+        <Ww>
+          <count>4</count>
+          <WinNumber>1</WinNumber>
+          <ItemText>g_ps2,0x0A</ItemText>
         </Ww>
       </WatchWindow1>
       <Tracepoint>

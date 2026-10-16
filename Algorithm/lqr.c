@@ -12,10 +12,13 @@ void LQR_Init(void)
 {
     memset(&g_lqr, 0, sizeof(g_lqr));
     /* K 应离线由实际机械参数和电流输入模型求得；现有值仍需实车验证。 */
-    g_lqr.gain[0] = -0.12822586f;
-    g_lqr.gain[1] = -0.25494726f;
-    g_lqr.gain[2] = -1.33878598f;
-    g_lqr.gain[3] = -0.11150894f;
+    g_lqr.gain[0] = -0.12917357f;
+    g_lqr.gain[1] = -0.27696665f;
+    g_lqr.gain[2] = -1.26644399f;
+    g_lqr.gain[3] = -0.11257765f;
+    g_lqr.balancePitchDeg = LQR_BALANCE_PITCH_DEG;
+    g_lqr.joystickPitchOffsetDeg = 0.0f;
+    g_lqr.outputScale = LQR_OUTPUT_SCALE;
     g_lqr.joystickSpeedScale = LQR_JOYSTICK_SPEED_SCALE;
 }
 
@@ -54,17 +57,20 @@ uint8_t LQR_AdvanceReference(int16_t forwardCommand)
 uint8_t LQR_Update(float positionM, float speedMps, float pitchDeg, float pitchRateDps)
 {
     float currentA = 0.0f;
+    float balancePitchDeg = g_lqr.balancePitchDeg + g_lqr.joystickPitchOffsetDeg;
+    float outputScale = g_lqr.outputScale;
     uint8_t index;
     g_lqr.valid = 0U;
     g_lqr.currentMa = 0;
     g_lqr.rawCurrentA = 0.0f;
     g_lqr.saturated = 0U;
     if (!isfinite(positionM) || !isfinite(speedMps) ||
-        !isfinite(pitchDeg) || !isfinite(pitchRateDps)) return 0U;
+        !isfinite(pitchDeg) || !isfinite(pitchRateDps) ||
+        !isfinite(balancePitchDeg) || !isfinite(outputScale) || outputScale < 0.0f) return 0U;
     /* Convert IMU angles to the model radian convention at this boundary. */
     g_lqr.state[0] = positionM - g_lqr.positionReference;
     g_lqr.state[1] = speedMps;
-    g_lqr.state[2] = pitchDeg * LQR_DEG_TO_RAD;
+    g_lqr.state[2] = (pitchDeg - balancePitchDeg) * LQR_DEG_TO_RAD;
     g_lqr.state[3] = pitchRateDps * LQR_DEG_TO_RAD;
     for (index = 0U; index < 4U; index++)
     {
@@ -76,6 +82,8 @@ uint8_t LQR_Update(float positionM, float speedMps, float pitchDeg, float pitchR
         if (!isfinite(g_lqr.gain[index])) return 0U;
         currentA -= g_lqr.gain[index] * g_lqr.state[index];
     }
+    if (!isfinite(currentA)) return 0U;
+    currentA *= outputScale;
     if (!isfinite(currentA)) return 0U;
     g_lqr.rawCurrentA = currentA;
     if (currentA > (float)LQR_CURRENT_LIMIT_MA * 0.001f)
